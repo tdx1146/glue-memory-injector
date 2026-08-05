@@ -13,7 +13,7 @@
 const GLUE_DEFAULT_URL = "http://127.0.0.1:19000";
 const FETCH_TIMEOUT_MS = 4000;   // 单次 HTTP 超时（远小于 hook 15s 预算）
 const QUERY_MAX_CHARS = 200;     // 查询取当前用户消息前 200 字
-const SOUL_MAX_CHARS = 300;      // 【回魂】段字数上限
+const SOUL_MAX_CHARS = 150;      // 【回魂】段字数上限（2026-08-05 压缩：去重+限条数，控 token）
 
 // 模块级限流状态（进程内共享，跨会话生效）
 let lastCallAt = 0;
@@ -93,12 +93,13 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS) {
   if (!data || typeof data !== "object") return null;
   const parts = [];
 
-  // 1. 自述（LMS self_ref）
+  // 1. 自述（LMS self_ref）：去重 + 最多 2 条（蒸馏缓存会产出连续重复）
   const voices = Array.isArray(data.lms_voice)
     ? data.lms_voice.filter((v) => typeof v === "string" && v.trim())
     : [];
-  if (voices.length > 0) {
-    parts.push(`自述:${voices.map((v) => v.trim().replace(/\s+/g, " ")).join("｜")}`);
+  const uniqVoices = [...new Set(voices.map((v) => v.trim().replace(/\s+/g, " ")))].slice(0, 2);
+  if (uniqVoices.length > 0) {
+    parts.push(`自述:${uniqVoices.join("｜")}`);
   }
 
   // 2. 状态（熵 / 惊讶 / 目的一致性 / 轮次）
@@ -110,16 +111,19 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS) {
   if (typeof st.turn_count === "number") stBits.push(`轮次${st.turn_count}`);
   if (stBits.length > 0) parts.push(`状态:${stBits.join(" ")}`);
 
-  // 3. 最近（沙漏最新记忆，最多 3 条）
+  // 3. 最近（沙漏最新记忆）：去重 + 最多 2 条
   const recents = Array.isArray(data.recent)
     ? data.recent.filter((r) => r && typeof r.text === "string" && r.text.trim())
     : [];
-  if (recents.length > 0) {
-    const brief = recents
-      .slice(0, 3)
-      .map((r) => r.text.trim().replace(/\s+/g, " "))
-      .join("｜");
-    parts.push(`最近:${brief}`);
+  const uniqRecents = [];
+  const seenR = new Set();
+  for (const r of recents) {
+    const t = r.text.trim().replace(/\s+/g, " ");
+    if (!seenR.has(t)) { seenR.add(t); uniqRecents.push(t); }
+    if (uniqRecents.length >= 2) break;
+  }
+  if (uniqRecents.length > 0) {
+    parts.push(`最近:${uniqRecents.join("｜")}`);
   }
 
   if (parts.length === 0) return null;
