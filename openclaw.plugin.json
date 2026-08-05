@@ -1,0 +1,45 @@
+{
+  "id": "glue-memory-injector",
+  "name": "Glue Memory Injector",
+  "description": "每轮对话前经胶水层 /recall 注入记忆上下文（fail-open 绝不阻塞主循环；限流 ≥2s；结果截断 ≤1500 字）。依赖 glue_server 127.0.0.1:19000 运行。",
+  "version": "1.0.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "总开关（false 时 hook 直接返回，不调胶水层）"
+      },
+      "glueUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:19000",
+        "description": "胶水层 HTTP 地址（glue_server）"
+      },
+      "k": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "default": 8,
+        "description": "召回条数"
+      },
+      "minIntervalMs": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 2000,
+        "description": "两次召回最小间隔（毫秒），限流防抖"
+      },
+      "maxChars": {
+        "type": "integer",
+        "minimum": 200,
+        "maximum": 4000,
+        "default": 1500,
+        "description": "注入上下文文本上限（字符），防爆上下文"
+      }
+    }
+  }
+}

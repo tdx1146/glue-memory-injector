@@ -1,0 +1,12 @@
+{
+  "name": "glue-memory-injector",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenClaw plugin: inject glue-layer memory recall into every prompt build (fail-open)",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}
