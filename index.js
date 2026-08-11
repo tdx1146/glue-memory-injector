@@ -32,11 +32,26 @@ export default definePluginEntry({
           // 双重判据：① ctx.trigger === "heartbeat"（run 级信号）
           //           ② prompt 文本含 heartbeat poll（兜底）。
           const isHeartbeat = ctx?.trigger === "heartbeat" || /heartbeat\s*poll/i.test(prompt);
+          // ★ 2026-08-11 召回L1-b：子代理轮不注入记忆。
+          // 子代理的"用户消息"是模板（[Subagent Context]…），真实任务在系统提示
+          // （hook 拿不到）；每轮注入 1500 字纯浪费且污染存储 —— 模板记忆被模板
+          // query 反复召回，形成自增强污染环（见《记忆召回相关性-调研与方案》§2.5）。
+          // 判据：ctx.sessionKey 含 subagent 段（agent:…:subagent:… 或 subagent: 前缀）。
+          const isSubagentRound =
+            typeof ctx?.sessionKey === "string" &&
+            /(^|:)subagent[:.]/i.test(ctx.sessionKey);
           const _dbg = prompt.slice(0, 100).replace(/\n/g, " ");
           try {
-            appendFileSync("/tmp/glue-hook-debug.log", `[${new Date().toISOString()}] trigger=${String(ctx?.trigger)} isHb=${isHeartbeat} prompt=${JSON.stringify(_dbg)}\n`);
+            appendFileSync("/tmp/glue-hook-debug.log", `[${new Date().toISOString()}] trigger=${String(ctx?.trigger)} isHb=${isHeartbeat} isSub=${isSubagentRound} sessionKey=${String(ctx?.sessionKey)} prompt=${JSON.stringify(_dbg)}\n`);
           } catch {}
-          if (isHeartbeat) return;
+          if (isHeartbeat || isSubagentRound) {
+            if (isSubagentRound && !isHeartbeat) {
+              try {
+                appendFileSync("/tmp/glue-hook-debug.log", `[${new Date().toISOString()}] SUBAGENT-SKIP sessionKey=${String(ctx?.sessionKey)}\n`);
+              } catch {}
+            }
+            return;
+          }
           const text = await buildMemoryContext(
             prompt,
             event?.context?.pluginConfig,
