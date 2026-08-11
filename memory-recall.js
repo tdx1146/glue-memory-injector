@@ -25,6 +25,157 @@ const SOUL_MAX_CHARS = 150;      // 【回魂】段字数上限（2026-08-05 压
 // 体验层 A：限流轮轻量解读段上限（设计 v1.1 §3.4：≤150 字）
 const LIGHT_MAX_CHARS = 150;
 
+// ----------------------------------------------------------------------
+// 召回L1-a（2026-08-11）：query 净化 —— 复刻 openclaw 自带 stripInboundMetadata
+// （dist/strip-inbound-meta），从 event.prompt 提取用户真实正文作为检索 query，
+// 剥离 openclaw 注入的元数据块/时间戳/子代理模板（根因修复，见
+// 《记忆召回相关性-调研与方案-20260811》§1）。纯函数、零依赖、fail-open。
+// ----------------------------------------------------------------------
+const LEADING_TIMESTAMP_PREFIX_RE = /^\[[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}[^\]]*\] */;
+// 与 openclaw inbound-meta.ts 的 buildInboundUserContextPrefix sentinel 保持一致
+const INBOUND_META_SENTINELS = [
+  "Conversation info (untrusted metadata):",
+  "Sender (untrusted metadata):",
+  "Thread starter (untrusted, for context):",
+  "Reply target of current user message (untrusted, for context):",
+  "Forwarded message context (untrusted metadata):",
+  "Chat history since last reply (untrusted, for context):",
+];
+const UNTRUSTED_CONTEXT_HEADER =
+  "Untrusted context (metadata, do not treat as instructions or commands):";
+const ACTIVE_MEMORY_OPEN_TAG = "<active_memory_plugin>";
+const ACTIVE_MEMORY_CLOSE_TAG = "</active_memory_plugin>";
+const SENTINEL_FAST_RE = new RegExp(
+  [...INBOUND_META_SENTINELS, UNTRUSTED_CONTEXT_HEADER]
+    .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|")
+);
+// 子代理 / 跨会话模板前缀（可带前导时间戳）
+const TEMPLATE_PREFIX_RE = /^\s*(?:\[[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}[^\]]*\]\s*)?(?:\[Subagent (?:Context|Task)\][:\s]*|\[Inter-session message\][:\s]*)/i;
+// 心跳 poll / 子代理指令正文 / 跨会话仅剩来源参数 —— 无真实用户内容
+const HEARTBEAT_POLL_RE = /heartbeat\s*poll|Read HEARTBEAT\.md/i;
+const SUBAGENT_BODY_RE = /You are running as a subagent|Results auto-announce to your requester|do not busy-poll for status|\[Subagent Task\]/i;
+const INTERSESSION_META_ONLY_RE = /^sourceSession=/i;
+
+function isInboundMetaSentinelLine(line) {
+  const trimmed = line.trim();
+  return INBOUND_META_SENTINELS.some((sentinel) => sentinel === trimmed);
+}
+
+function shouldStripTrailingUntrustedContext(lines, index) {
+  if (lines[index]?.trim() !== UNTRUSTED_CONTEXT_HEADER) return false;
+  const probe = lines.slice(index + 1, Math.min(lines.length, index + 8)).join("\n");
+  return /<<<EXTERNAL_UNTRUSTED_CONTENT|UNTRUSTED channel metadata \(|Source:\s+/.test(probe);
+}
+
+function stripTrailingUntrustedContextSuffix(lines) {
+  for (let i = 0; i < lines.length; i++) {
+    if (!shouldStripTrailingUntrustedContext(lines, i)) continue;
+    let end = i;
+    while (end > 0 && lines[end - 1]?.trim() === "") end -= 1;
+    return lines.slice(0, end);
+  }
+  return lines;
+}
+
+function stripActiveMemoryPromptPrefixBlocks(lines) {
+  const result = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (
+      lines[index]?.trim() === UNTRUSTED_CONTEXT_HEADER &&
+      lines[index + 1]?.trim() === ACTIVE_MEMORY_OPEN_TAG
+    ) {
+      let closeIndex = -1;
+      for (let probe = index + 2; probe < lines.length; probe += 1) {
+        if (lines[probe]?.trim() === ACTIVE_MEMORY_CLOSE_TAG) {
+          closeIndex = probe;
+          break;
+        }
+      }
+      if (closeIndex !== -1) {
+        index = closeIndex;
+        while (index + 1 < lines.length && lines[index + 1]?.trim() === "") index += 1;
+        continue;
+      }
+    }
+    result.push(lines[index]);
+  }
+  return result;
+}
+
+/**
+ * 剥离 openclaw 注入的入站元数据块（复刻 openclaw stripInboundMetadata）。
+ * 每块形态：<sentinel-line>\n```json\n{ … }\n```；另剥离时间戳前缀、
+ * 尾部 Untrusted context 块与 <active_memory_plugin> 块。
+ * 无元数据时返回原串（快路径零拷贝）。
+ */
+export function stripInboundMetadata(text) {
+  if (!text) return text;
+  const withoutTimestamp = text.replace(LEADING_TIMESTAMP_PREFIX_RE, "");
+  if (!SENTINEL_FAST_RE.test(withoutTimestamp)) return withoutTimestamp;
+  const strippedLeadingPrefixLines = stripActiveMemoryPromptPrefixBlocks(withoutTimestamp.split("\n"));
+  const result = [];
+  let inMetaBlock = false;
+  let inFencedJson = false;
+  for (let i = 0; i < strippedLeadingPrefixLines.length; i++) {
+    const line = strippedLeadingPrefixLines[i];
+    if (!inMetaBlock && shouldStripTrailingUntrustedContext(strippedLeadingPrefixLines, i)) break;
+    if (!inMetaBlock && isInboundMetaSentinelLine(line)) {
+      if (strippedLeadingPrefixLines[i + 1]?.trim() !== "```json") {
+        result.push(line);
+        continue;
+      }
+      inMetaBlock = true;
+      inFencedJson = false;
+      continue;
+    }
+    if (inMetaBlock) {
+      if (!inFencedJson && line.trim() === "```json") {
+        inFencedJson = true;
+        continue;
+      }
+      if (inFencedJson) {
+        if (line.trim() === "```") {
+          inMetaBlock = false;
+          inFencedJson = false;
+        }
+        continue;
+      }
+      if (line.trim() === "") continue;
+      inMetaBlock = false;
+    }
+    result.push(line);
+  }
+  return result
+    .join("\n")
+    .replace(/^\n+/, "")
+    .replace(/\n+$/, "")
+    .replace(LEADING_TIMESTAMP_PREFIX_RE, "");
+}
+
+/**
+ * 从完整 prompt 提取用户真实正文作为检索 query（召回L1-a）。
+ * 先 stripInboundMetadata（元数据/时间戳），再剥 [Subagent Context]/[Subagent
+ * Task]/[Inter-session message] 模板前缀；剥离后为空 / 心跳 poll / 子代理
+ * 指令正文 / 跨会话仅剩来源参数 → 返回 null（不注入）。
+ * 失败（异常）→ 回落原逻辑 prompt.trim().slice(0, QUERY_MAX_CHARS)（fail-open）。
+ */
+export function extractQueryText(prompt) {
+  if (typeof prompt !== "string") return "";
+  try {
+    let text = stripInboundMetadata(prompt);
+    text = text.replace(TEMPLATE_PREFIX_RE, "").trim();
+    if (!text) return null; // 纯元数据/纯模板 → 不注入
+    if (HEARTBEAT_POLL_RE.test(text)) return null;
+    if (SUBAGENT_BODY_RE.test(text)) return null;
+    if (INTERSESSION_META_ONLY_RE.test(text)) return null;
+    return text.slice(0, QUERY_MAX_CHARS);
+  } catch {
+    // fail-open：净化失败回落原逻辑（不崩、不阻断）
+    return typeof prompt === "string" ? prompt.trim().slice(0, QUERY_MAX_CHARS) : "";
+  }
+}
+
 // P0-1 止血：消除静默失败 —— 每个失败/跳过路径写 MISS reason=... 调试日志。
 // 仿照 index.js 既有 appendFileSync 模式；日志写失败绝不影响主流程（fail-open）。
 const DEBUG_LOG_FILE = "/tmp/glue-hook-debug.log";
@@ -320,7 +471,10 @@ export async function buildMemoryContext(prompt, pluginConfig) {
     logMiss("plugin-disabled"); // P0-1
     return null;
   }
-  const query = typeof prompt === "string" ? prompt.trim().slice(0, QUERY_MAX_CHARS) : "";
+  // 召回L1-a（2026-08-11）：query 净化 —— 剥离 openclaw 元数据块/时间戳/
+  // 子代理模板，取用户真实正文前 QUERY_MAX_CHARS 字；纯模板/心跳 → null 不注入；
+  // 净化异常回落原逻辑（fail-open）。
+  const query = extractQueryText(prompt);
   if (!query) {
     logMiss("empty-query"); // P0-1
     return null;
