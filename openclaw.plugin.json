@@ -39,6 +39,48 @@
         "maximum": 4000,
         "default": 1500,
         "description": "注入上下文文本上限（字符），防爆上下文"
+      },
+      "storeTurn": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "写侧自动入库开关（阶段2灰度默认关；开启后 agent_end 每轮经 glue /store-turn 写 LMS /store）"
+          },
+          "sessionIds": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": ["main"],
+            "description": "允许自动写入的会话白名单（默认 main，与 LMS /store 白名单对齐）"
+          },
+          "minIntervalMs": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 3000,
+            "description": "两次自动写入最小间隔（毫秒），防写放大"
+          },
+          "userMaxChars": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 2000,
+            "description": "user_input 截断上限（字符）"
+          },
+          "outputMaxChars": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 20000,
+            "description": "llm_output 截断上限（字符）"
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 30000,
+            "default": 12000,
+            "description": "写请求 AbortSignal 超时（M-3 校准：/store 内部 3×跨机 embed 最坏 ≈6.75s，12s << 30s hook 预算）"
+          }
+        }
       }
     }
   }

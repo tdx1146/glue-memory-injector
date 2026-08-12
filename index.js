@@ -9,9 +9,14 @@
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { buildMemoryContext } from "./memory-recall.js";
+import { handleAgentEnd } from "./store-turn.js";
 import { appendFileSync } from "node:fs";
 
 const HOOK_TIMEOUT_MS = 15000; // 与 runner 默认 before_prompt_build 预算一致
+// 阶段2（S2-1）：agent_end 观察型钩子预算。30s 是 runner 默认上限
+// （DEFAULT_VOID_HOOK_TIMEOUT_MS_BY_HOOK={agent_end:3e4}，源码实证）；
+// 写侧自身 AbortSignal 12s（M-3）远小于此，钩子绝不拖慢主循环。
+const AGENT_END_TIMEOUT_MS = 30000;
 
 export default definePluginEntry({
   id: "glue-memory-injector",
@@ -78,6 +83,22 @@ export default definePluginEntry({
         }
       },
       { timeoutMs: HOOK_TIMEOUT_MS },
+    );
+
+    // 阶段2（S2-1）：agent_end 写侧（观察型，fire-and-forget，默认关）。
+    //   - 逻辑全在 store-turn.js（纯模块可单测）；本文件只做 SDK 接线。
+    //   - 默认关：config.storeTurn.enabled=false → handleAgentEnd 首行 return
+    //     （写侧零副作用；钩子已注册且被授予会话读取权限——碰 openclaw 运行时，
+    //     G-5 表述）。
+    //   - fail-open 三重：提取异常→skip；网络异常/超时→记日志返回；
+    //     钩子抛错→runner catch（30s 预算 + fire-and-forget 机制实证）。
+    //   - 需要 openclaw.json 配 plugins.entries.glue-memory-injector.hooks
+    //     .allowConversationAccess=true，否则非 bundled 插件该钩子被加载器丢弃
+    //     （loader 源码实证）——见 S2-2。
+    api.on(
+      "agent_end",
+      (event, ctx) => handleAgentEnd(event, ctx, api),
+      { timeoutMs: AGENT_END_TIMEOUT_MS },
     );
   },
 });

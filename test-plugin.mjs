@@ -356,6 +356,208 @@ async function recallFromGlueForTest() {
   return resp.json();
 }
 
+console.log("== 2.5 store-turn 写侧（agent_end，阶段2 S2-1）==");
+
+const {
+  resolveStoreConfig,
+  extractTurnFromMessages,
+  buildStorePayload,
+  storeTurnFromGlue,
+  handleAgentEnd,
+  _resetFingerprintForTest,
+  _getFingerprintStateForTest,
+} = await import("./store-turn.js");
+
+// ---- 工具：mock /store-turn server（记录请求数，返回可配置 StoreResponse）----
+function startMockStoreTurn({ respond = () => 200, resp = {} } = {}) {
+  const state = { requests: [], bodies: [] };
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      state.requests.push(req.url);
+      try { state.bodies.push(JSON.parse(body || "{}")); } catch { state.bodies.push({}); }
+      const code = respond(state);
+      res.writeHead(code, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(code === 200 ? resp : { detail: "mock" }));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ server, port: server.address().port, state });
+    });
+  });
+}
+
+const MSGS_NORMAL = [
+  { role: "user", content: "帮我回忆之前的总线工程进度" },
+  { role: "assistant", content: [{ type: "text", text: "上次讨论过 Agent OS 总线 Phase 5 计划，进度是 X。" }] },
+];
+
+await okAsync("extractTurnFromMessages：正常轮 → 提取双段 + turnKey", () => {
+  const t = extractTurnFromMessages(MSGS_NORMAL);
+  assert.equal(t.skip, undefined);
+  assert.equal(t.userInput, "帮我回忆之前的总线工程进度");
+  assert.ok(t.assistantText.includes("总线 Phase 5"));
+  assert.ok(/^[0-9a-f]{64}$/.test(t.turnKey), "turnKey 应为 sha256 hex");
+});
+
+await okAsync("闸：模板轮（[Subagent Context]）→ skip template", () => {
+  const t = extractTurnFromMessages([
+    { role: "user", content: "[Subagent Context] 子代理任务派发" },
+    { role: "assistant", content: "好的，我开始了。" },
+  ]);
+  assert.equal(t.skip, "template");
+});
+
+await okAsync("闸：心跳文本轮 → skip heartbeat", () => {
+  const t = extractTurnFromMessages([
+    { role: "user", content: "[Tue 2026-08-12 08:00:00] heartbeat poll 检查" },
+    { role: "assistant", content: "HEARTBEAT_OK" },
+  ]);
+  assert.equal(t.skip, "heartbeat");
+});
+
+await okAsync("模式 B：INTERSESSION 回灌轮 → userInput 置空、assistant 段保留（M-4）", () => {
+  const t = extractTurnFromMessages([
+    { role: "user", content: "[Inter-session message] sourceSession=agent:main:subagent:abc 完整子代理报告……（4521字）" },
+    { role: "assistant", content: [{ type: "text", text: "子代理调研完成，采纳其核心结论：方案 B 更优。" }] },
+  ]);
+  assert.equal(t.skip, undefined);
+  assert.equal(t.userInput, "", "模式 B：报告全文回声丢弃");
+  assert.ok(t.assistantText.includes("方案 B 更优"), "主代理采纳总结段照常提取");
+  assert.equal(t.modeB, true);
+});
+
+await okAsync("闸：无助手文本轮（纯工具轮）→ skip no-text", () => {
+  const t = extractTurnFromMessages([
+    { role: "user", content: "查询一下" },
+    { role: "assistant", content: [{ type: "toolCall", name: "web_search", arguments: "{}" }] },
+    { role: "toolResult", content: "结果" },
+  ]);
+  assert.equal(t.skip, "no-text");
+});
+
+await okAsync("闸：空消息 → skip empty", () => {
+  assert.equal(extractTurnFromMessages([]).skip, "empty");
+  assert.equal(extractTurnFromMessages([{ role: "user", content: "   " }]).skip, "empty");
+});
+
+await okAsync("buildStorePayload：字段 + sender 审计 + 截断", () => {
+  const cfg = resolveStoreConfig({ storeTurn: { enabled: true } });
+  const p = buildStorePayload({ userInput: "u", assistantText: "a".repeat(30000) }, cfg, "main");
+  assert.equal(p.session_id, "main");
+  assert.equal(p.user_input, "u");
+  assert.equal(p.sender, "openclaw-agent_end");
+  assert.equal(p.llm_output.length, cfg.outputMaxChars, "llm_output 应截断到 outputMaxChars");
+});
+
+await okAsync("storeTurnFromGlue：200 → ok + 透传 stored/dedup_hit", async () => {
+  const { server, port, state } = await startMockStoreTurn({
+    resp: { session_id: "main", turn_count: 126, stored: true, dedup_hit: false },
+  });
+  try {
+    const r = await storeTurnFromGlue({ glueUrl: `http://127.0.0.1:${port}`, timeoutMs: 3000 }, { session_id: "main" });
+    assert.equal(r.ok, true);
+    assert.equal(r.data.stored, true);
+    assert.equal(state.bodies[0].session_id, "main");
+  } finally { server.close(); }
+});
+
+await okAsync("storeTurnFromGlue：503 → {ok:false,status:'503'}（不重试，C-05）", async () => {
+  const { server, port } = await startMockStoreTurn({ respond: () => 503 });
+  try {
+    const r = await storeTurnFromGlue({ glueUrl: `http://127.0.0.1:${port}`, timeoutMs: 3000 }, {});
+    assert.equal(r.ok, false);
+    assert.equal(r.status, "503");
+  } finally { server.close(); }
+});
+
+await okAsync("storeTurnFromGlue：glue 不可达 → network（fail-open）", async () => {
+  const r = await storeTurnFromGlue({ glueUrl: "http://127.0.0.1:1", timeoutMs: 3000 }, {});
+  assert.equal(r.ok, false);
+  assert.equal(r.status, "network");
+});
+
+await okAsync("handleAgentEnd：默认关 → 不写（STORE-SKIP plugin-disabled）", async () => {
+  _resetFingerprintForTest();
+  const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
+  try {
+    await handleAgentEnd(
+      { messages: MSGS_NORMAL, success: true, context: {} },
+      { runId: "r1", sessionId: "main" },
+      { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: false } } },
+    );
+    assert.equal(state.requests.length, 0, "默认关必须零请求");
+  } finally { server.close(); }
+});
+
+await okAsync("handleAgentEnd：四闸跳过（心跳/子代理/cron/失败轮）", async () => {
+  _resetFingerprintForTest();
+  const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
+  try {
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "h", sessionId: "main", trigger: "heartbeat" }, api);
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "s", sessionId: "main", sessionKey: "agent:main:subagent:abc" }, api);
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "c", sessionId: "main", jobId: "job-1", trigger: "cron" }, api);
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: false, error: "aborted" }, { runId: "f", sessionId: "main" }, api);
+    assert.equal(state.requests.length, 0, "四闸轮必须零请求");
+  } finally { server.close(); }
+});
+
+await okAsync("handleAgentEnd：正常轮 → 写入 + seq 递增 + 指纹防双 fire", async () => {
+  _resetFingerprintForTest();
+  const { server, port, state } = await startMockStoreTurn({
+    resp: { session_id: "main", turn_count: 127, stored: true, dedup_hit: false, core_chars: 30, gray: false },
+  });
+  try {
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    // 同 runId 双 fire（嵌入式重试循环模拟，M-2）→ 第二次指纹拦截
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-A", sessionId: "main" }, api);
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-A", sessionId: "main" }, api);
+    assert.equal(state.requests.length, 1, "同 runId 同内容双 fire 只写 1 次（指纹去重）");
+    assert.equal(_getFingerprintStateForTest().seq, 1, "seq=1（stored=true 一次）");
+    // 不同 runId 同内容 → 指纹不拦，但可落 L2 幂等（模拟不同轮）
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-B", sessionId: "main" }, api);
+    assert.equal(state.requests.length, 2, "不同 runId 允许再写（L4 有界冗余，L2 兜底）");
+  } finally { server.close(); }
+});
+
+await okAsync("handleAgentEnd：LMS 挂（glue 502）→ STORE-FAIL 不抛错（fail-open）", async () => {
+  _resetFingerprintForTest();
+  const { server, port } = await startMockStoreTurn({ respond: () => 502 });
+  try {
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    let threw = false;
+    try {
+      await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "f1", sessionId: "main" }, api);
+    } catch { threw = true; }
+    assert.equal(threw, false, "502 必须 fail-open 不抛错");
+  } finally { server.close(); }
+});
+
+await okAsync("handleAgentEnd：INTERSESSION 轮 → 模式 B 写入（assistant 段入库）", async () => {
+  _resetFingerprintForTest();
+  const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
+  try {
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    await handleAgentEnd(
+      {
+        messages: [
+          { role: "user", content: "[Inter-session message] sourceSession=agent:main:subagent:abc 报告全文……" },
+          { role: "assistant", content: [{ type: "text", text: "采纳子代理结论。" }] },
+        ],
+        success: true,
+      },
+      { runId: "inter1", sessionId: "main" },
+      api,
+    );
+    assert.equal(state.requests.length, 1, "模式 B 应写入 1 次");
+    assert.equal(state.bodies[0].user_input, "", "user 段（报告回声）丢弃");
+    assert.ok(state.bodies[0].llm_output.includes("采纳子代理结论"), "assistant 段入库");
+  } finally { server.close(); }
+});
+
 console.log("== 3. index.js 接线测试（SDK shim，临时 node_modules）==");
 // 临时 SDK shim：definePluginEntry 原样返回入口对象（与真实 SDK 语义一致）
 const shimDir = join(HERE, "node_modules", "openclaw", "plugin-sdk");
@@ -381,15 +583,19 @@ const wiringSrc = `
 import assert from "node:assert/strict";
 import entry from "./index.js";
 assert.equal(entry.id, "glue-memory-injector");
-let registered = null;
+let registeredHooks = [];
 const fakeApi = {
-  on(name, handler, opts) { registered = { name, handler, opts }; },
+  on(name, handler, opts) { registeredHooks.push({ name, handler, opts }); },
   logger: { warn: (...a) => {} },
 };
 entry.register(fakeApi);
-assert.equal(registered.name, "before_prompt_build");
-// 用真实 glue_server（只读）驱动 handler，验证返回结构
-const result = await registered.handler(
+const bpbHook = registeredHooks.find((h) => h.name === "before_prompt_build");
+const agentEndHook = registeredHooks.find((h) => h.name === "agent_end");
+assert.ok(bpbHook, "应注册 before_prompt_build（读侧不受影响）");
+assert.ok(agentEndHook, "应注册 agent_end（写侧，S2-1）");
+assert.equal(agentEndHook.opts.timeoutMs, 30000, "agent_end 预算 30s（runner 默认，源码实证）");
+// 用真实 glue_server（只读）驱动读侧 handler，验证返回结构
+const result = await bpbHook.handler(
   { prompt: "帮我回忆总线工程进度", context: { pluginConfig: {} } },
   {},
 );
@@ -403,12 +609,17 @@ if (result) {
   );
 }
 // 故障路径：glueUrl 不可达 → undefined（fail-open）
-const result2 = await registered.handler(
+const result2 = await bpbHook.handler(
   { prompt: "x", context: { pluginConfig: { glueUrl: "http://127.0.0.1:1", minIntervalMs: 0 } } },
   {},
 );
 assert.equal(result2, undefined);
-console.log("  ✅ 接线 OK: hook=before_prompt_build, 返回结构正确, fail-open 正确");
+// agent_end 钩子：默认关（pluginConfig 无 storeTurn）→ 不抛错、不写
+await agentEndHook.handler(
+  { messages: [{ role: "user", content: "x" }, { role: "assistant", content: "y" }], success: true, context: {} },
+  { runId: "wiring", sessionId: "main" },
+);
+console.log("  ✅ 接线 OK: hook=before_prompt_build+agent_end, 返回结构正确, fail-open 正确");
 `;
 const wiringFile = join(HERE, ".test-wiring.mjs");
 writeFileSync(wiringFile, wiringSrc);
