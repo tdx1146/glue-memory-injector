@@ -444,12 +444,30 @@ await okAsync("闸：空消息 → skip empty", () => {
 });
 
 await okAsync("buildStorePayload：字段 + sender 审计 + 截断", () => {
-  const cfg = resolveStoreConfig({ storeTurn: { enabled: true } });
+  const cfg = resolveStoreConfig({ storeTurn: { minIntervalMs: 0 } }, { GLUE_STORE_TURN_ENABLED: "true" });
   const p = buildStorePayload({ userInput: "u", assistantText: "a".repeat(30000) }, cfg, "main");
   assert.equal(p.session_id, "main");
   assert.equal(p.user_input, "u");
   assert.equal(p.sender, "openclaw-agent_end");
   assert.equal(p.llm_output.length, cfg.outputMaxChars, "llm_output 应截断到 outputMaxChars");
+});
+
+await okAsync("resolveStoreConfig：开关唯一权威 = env（config→env 修复）", () => {
+  // env 未设 → 默认关（含 config 未设 / config.enabled=false）
+  assert.equal(resolveStoreConfig({}, {}).enabled, false, "env 未设 = 关");
+  assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: undefined }).enabled, false, "env 键存在但值 undefined = 关");
+  // config.storeTurn.enabled 不再控制开关（弃用）：置 true 但 env 未设 → 仍关 + 弃用标记
+  const dep = resolveStoreConfig({ storeTurn: { enabled: true } }, {});
+  assert.equal(dep.enabled, false, "config.enabled=true 不再开闸（防旧配置误开）");
+  assert.equal(dep.configEnabledDeprecated, true, "应标记弃用（handleAgentEnd 记日志防静默）");
+  // env=true → 开（config 无关）
+  assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: "true" }).enabled, true, "env='true' → 开");
+  assert.equal(resolveStoreConfig({ storeTurn: { enabled: false } }, { GLUE_STORE_TURN_ENABLED: "true" }).enabled, true, "env 权威，config=false 不影响");
+  assert.equal(resolveStoreConfig({ storeTurn: { enabled: true } }, { GLUE_STORE_TURN_ENABLED: "true" }).configEnabledDeprecated, false, "env 已开则无弃用标记");
+  // 严格 "true"：其他真值不开
+  assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: "TRUE" }).enabled, false, "'TRUE' 不开（严格小写 true）");
+  assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: "1" }).enabled, false, "'1' 不开");
+  assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: "" }).enabled, false, "空串不开");
 });
 
 await okAsync("storeTurnFromGlue：200 → ok + 透传 stored/dedup_hit", async () => {
@@ -487,8 +505,23 @@ await okAsync("handleAgentEnd：默认关 → 不写（STORE-SKIP plugin-disable
       { messages: MSGS_NORMAL, success: true, context: {} },
       { runId: "r1", sessionId: "main" },
       { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: false } } },
+      {}, // env 未设 → 关（config.enabled=false 本就无关）
     );
     assert.equal(state.requests.length, 0, "默认关必须零请求");
+  } finally { server.close(); }
+});
+
+await okAsync("handleAgentEnd：config.enabled=true 但 env 未设 → 不写 + 弃用标记（防静默）", async () => {
+  _resetFingerprintForTest();
+  const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
+  try {
+    await handleAgentEnd(
+      { messages: MSGS_NORMAL, success: true, context: {} },
+      { runId: "r2", sessionId: "main" },
+      { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true } } },
+      {}, // env 未设：config.enabled=true 已被弃用，不得开闸
+    );
+    assert.equal(state.requests.length, 0, "旧配置路径不得开闸（零请求）");
   } finally { server.close(); }
 });
 
@@ -496,11 +529,12 @@ await okAsync("handleAgentEnd：四闸跳过（心跳/子代理/cron/失败轮�
   _resetFingerprintForTest();
   const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
   try {
-    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
-    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "h", sessionId: "main", trigger: "heartbeat" }, api);
-    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "s", sessionId: "main", sessionKey: "agent:main:subagent:abc" }, api);
-    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "c", sessionId: "main", jobId: "job-1", trigger: "cron" }, api);
-    await handleAgentEnd({ messages: MSGS_NORMAL, success: false, error: "aborted" }, { runId: "f", sessionId: "main" }, api);
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { minIntervalMs: 0 } } };
+    const env = { GLUE_STORE_TURN_ENABLED: "true" }; // 开关 = env（config→env 修复）
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "h", sessionId: "main", trigger: "heartbeat" }, api, env);
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "s", sessionId: "main", sessionKey: "agent:main:subagent:abc" }, api, env);
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "c", sessionId: "main", jobId: "job-1", trigger: "cron" }, api, env);
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: false, error: "aborted" }, { runId: "f", sessionId: "main" }, api, env);
     assert.equal(state.requests.length, 0, "四闸轮必须零请求");
   } finally { server.close(); }
 });
@@ -511,14 +545,15 @@ await okAsync("handleAgentEnd：正常轮 → 写入 + seq 递增 + 指纹防双
     resp: { session_id: "main", turn_count: 127, stored: true, dedup_hit: false, core_chars: 30, gray: false },
   });
   try {
-    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { minIntervalMs: 0 } } };
+    const env = { GLUE_STORE_TURN_ENABLED: "true" }; // 开关 = env
     // 同 runId 双 fire（嵌入式重试循环模拟，M-2）→ 第二次指纹拦截
-    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-A", sessionId: "main" }, api);
-    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-A", sessionId: "main" }, api);
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-A", sessionId: "main" }, api, env);
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-A", sessionId: "main" }, api, env);
     assert.equal(state.requests.length, 1, "同 runId 同内容双 fire 只写 1 次（指纹去重）");
     assert.equal(_getFingerprintStateForTest().seq, 1, "seq=1（stored=true 一次）");
     // 不同 runId 同内容 → 指纹不拦，但可落 L2 幂等（模拟不同轮）
-    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-B", sessionId: "main" }, api);
+    await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-B", sessionId: "main" }, api, env);
     assert.equal(state.requests.length, 2, "不同 runId 允许再写（L4 有界冗余，L2 兜底）");
   } finally { server.close(); }
 });
@@ -527,10 +562,11 @@ await okAsync("handleAgentEnd：LMS 挂（glue 502）→ STORE-FAIL 不抛错（
   _resetFingerprintForTest();
   const { server, port } = await startMockStoreTurn({ respond: () => 502 });
   try {
-    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { minIntervalMs: 0 } } };
+    const env = { GLUE_STORE_TURN_ENABLED: "true" };
     let threw = false;
     try {
-      await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "f1", sessionId: "main" }, api);
+      await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "f1", sessionId: "main" }, api, env);
     } catch { threw = true; }
     assert.equal(threw, false, "502 必须 fail-open 不抛错");
   } finally { server.close(); }
@@ -540,7 +576,8 @@ await okAsync("handleAgentEnd：INTERSESSION 轮 → 模式 B 写入（assistant
   _resetFingerprintForTest();
   const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
   try {
-    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { minIntervalMs: 0 } } };
+    const env = { GLUE_STORE_TURN_ENABLED: "true" };
     await handleAgentEnd(
       {
         messages: [
@@ -551,6 +588,7 @@ await okAsync("handleAgentEnd：INTERSESSION 轮 → 模式 B 写入（assistant
       },
       { runId: "inter1", sessionId: "main" },
       api,
+      env,
     );
     assert.equal(state.requests.length, 1, "模式 B 应写入 1 次");
     assert.equal(state.bodies[0].user_input, "", "user 段（报告回声）丢弃");

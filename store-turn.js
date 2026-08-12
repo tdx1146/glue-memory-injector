@@ -3,8 +3,22 @@
 // 设计：《阶段2-写侧接线设计-20260812.md》v1.1 §2（S2-1）＋锐审 M-1~M-7。
 // 纯 ESM，零 OpenClaw SDK 依赖，可直接单测（仿 memory-recall.js 风格）。
 //
+// 2026-08-12 开关修复（config → env，翻车复盘见下）：
+//   翻车：openclaw.json 的 config.storeTurn 里写 {enabled:true, gray:true} → configSchema
+//   白名单（storeTurn 子对象 additionalProperties:false，无 gray 字段）→ preflight 校验失败
+//   → gateway 起不来。根因：①开关走 openclaw.json config（schema 白名单管控，天然脆）；
+//   ②gray 是 LMS 侧概念（LMS_STORE_GRAY，LMS .env，请求时读取热生效），被误塞进插件 config。
+//   修复定案：
+//     - 开关唯一权威 = gateway 进程 env `GLUE_STORE_TURN_ENABLED`（严格等于 "true" 才开，
+//       未设/其他 = 关）。注入路径：~/.openclaw/.env（gateway 启动 loadDotEnv 读取，无键黑名单，
+//       源码实证：config 加载链 maybeLoadDotEnvForConfig → loadDotEnv → resolveConfigDir(env)/.env）。
+//       纯 env：config.storeTurn.enabled 不再控制开关；若被置 true 记 STORE-SKIP
+//       reason=config-enabled-deprecated（防旧文档操作静默失效）。
+//     - 灰度标记归 LMS 侧（LMS_STORE_GRAY），插件不读不传、仅回显 /store 响应 d.gray；
+//       不引入 GLUE_STORE_GRAY（避免双源不一致）。
+//
 // 硬约束（设计 §2.1）：
-//   1. 默认关：storeTurn.enabled=false（openclaw.json config）→ handler 首行跳过，
+//   1. 默认关：GLUE_STORE_TURN_ENABLED 未设 → handler 首行跳过，
 //      写侧零副作用（钩子已注册且被授予会话读取权限——碰 openclaw 运行时，G-5）。
 //   2. fail-open 三重：提取异常→skip；网络异常/超时→记日志返回；钩子抛错→runner catch。
 //   3. 只写 main 脑白名单会话（sessionIds 默认 ["main"]，与 LMS /store 白名单对齐）。
@@ -27,6 +41,8 @@ const USER_MAX_CHARS = 2000;
 const OUTPUT_MAX_CHARS = 20000;
 const SENDER = "openclaw-agent_end";
 const STORE_LOG_FILE = "/tmp/glue-store-debug.log";
+// 开关 env（2026-08-12 修复：config → env，见文件头）。值必须精确为 "true"。
+const STORE_TURN_ENABLED_ENV = "GLUE_STORE_TURN_ENABLED";
 
 // 与 memory-recall.js 同源复制的净化正则（同源同判据，防污染一致；
 // 复制而非导出——不触碰读侧文件，红线段落零改动）
@@ -56,14 +72,20 @@ function logStore(kind, detail) {
 }
 
 /**
- * 解析 storeTurn 配置（插件自有配置在 plugins.entries.<id>.config 的 storeTurn 子对象）。
+ * 解析 storeTurn 配置（开关 = env，调优参数 = config.storeTurn 子对象）。
  * 安全默认：全部默认值即"默认关 + main 白名单 + 12s 熔断"。
+ * @param {object} [pluginConfig] plugins.entries.<id>.config（storeTurn 子对象）
+ * @param {object} [env] 环境变量注入点（默认 process.env；单测可传假对象）
  */
-export function resolveStoreConfig(pluginConfig) {
+export function resolveStoreConfig(pluginConfig, env = process.env) {
   const pc = pluginConfig && typeof pluginConfig === "object" ? pluginConfig : {};
   const st = pc.storeTurn && typeof pc.storeTurn === "object" ? pc.storeTurn : {};
+  // 开关唯一权威 = env（严格 "true"）；config.storeTurn.enabled 已弃用：
+  // 若被置 true 但 env 未开 → configEnabledDeprecated 标记，handleAgentEnd 记日志防静默。
+  const enabled = (env && env[STORE_TURN_ENABLED_ENV]) === "true";
   return {
-    enabled: st.enabled === true, // 默认关（只有显式 true 才开）
+    enabled, // 默认关（env 未设/非 "true"）
+    configEnabledDeprecated: !enabled && st.enabled === true,
     sessionIds:
       Array.isArray(st.sessionIds) && st.sessionIds.length > 0
         ? st.sessionIds.map(String)
@@ -247,19 +269,26 @@ function fingerprintSet(key) {
 
 /**
  * agent_end 钩子入口（观察型，fire-and-forget；任何异常吞掉 fail-open）。
- * 默认关：storeTurn.enabled=false → 首行 return（写侧零副作用）。
+ * 默认关：GLUE_STORE_TURN_ENABLED 未设 → 首行 return（写侧零副作用）。
+ * 开关 = env（第 4 参 env 为测试注入点，默认 process.env）；
  * 配置读取双保险（G-3）：register() 时 api.pluginConfig 快照 + event.context.pluginConfig
  * 热覆盖（typed api.on 路径实际不注入 event.context.pluginConfig，防御性读取）。
  */
-export async function handleAgentEnd(event, ctx, api) {
+export async function handleAgentEnd(event, ctx, api, env = process.env) {
   try {
     const cfg = resolveStoreConfig(
       event?.context?.pluginConfig ?? api?.pluginConfig,
+      env,
     );
     const runId =
       typeof ctx?.runId === "string" && ctx.runId ? ctx.runId : "no-runid";
     if (!cfg.enabled) {
-      logStore("STORE-SKIP", `reason=plugin-disabled run=${runId}`);
+      logStore(
+        "STORE-SKIP",
+        cfg.configEnabledDeprecated
+          ? `reason=config-enabled-deprecated（开关已迁移到 ${STORE_TURN_ENABLED_ENV} env，config.storeTurn.enabled 不再生效） run=${runId}`
+          : `reason=plugin-disabled run=${runId}`,
+      );
       return;
     }
 
