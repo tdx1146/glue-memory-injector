@@ -452,22 +452,22 @@ await okAsync("buildStorePayload：字段 + sender 审计 + 截断", () => {
   assert.equal(p.llm_output.length, cfg.outputMaxChars, "llm_output 应截断到 outputMaxChars");
 });
 
-await okAsync("resolveStoreConfig：开关唯一权威 = env（config→env 修复）", () => {
-  // env 未设 → 默认关（含 config 未设 / config.enabled=false）
-  assert.equal(resolveStoreConfig({}, {}).enabled, false, "env 未设 = 关");
+await okAsync("resolveStoreConfig：开关 = config 优先 + env fallback（2026-08-12 最终定案）", () => {
+  // 默认关：config 未设 + env 未设
+  assert.equal(resolveStoreConfig({}, {}).enabled, false, "全未设 = 关");
   assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: undefined }).enabled, false, "env 键存在但值 undefined = 关");
-  // config.storeTurn.enabled 不再控制开关（弃用）：置 true 但 env 未设 → 仍关 + 弃用标记
-  const dep = resolveStoreConfig({ storeTurn: { enabled: true } }, {});
-  assert.equal(dep.enabled, false, "config.enabled=true 不再开闸（防旧配置误开）");
-  assert.equal(dep.configEnabledDeprecated, true, "应标记弃用（handleAgentEnd 记日志防静默）");
-  // env=true → 开（config 无关）
-  assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: "true" }).enabled, true, "env='true' → 开");
-  assert.equal(resolveStoreConfig({ storeTurn: { enabled: false } }, { GLUE_STORE_TURN_ENABLED: "true" }).enabled, true, "env 权威，config=false 不影响");
-  assert.equal(resolveStoreConfig({ storeTurn: { enabled: true } }, { GLUE_STORE_TURN_ENABLED: "true" }).configEnabledDeprecated, false, "env 已开则无弃用标记");
-  // 严格 "true"：其他真值不开
+  // config 优先（schema 合法路径）：enabled=true → 开（env 未设 / env=false 均不影响）
+  assert.equal(resolveStoreConfig({ storeTurn: { enabled: true } }, {}).enabled, true, "config.enabled=true + env 未设 → 开");
+  assert.equal(resolveStoreConfig({ storeTurn: { enabled: true } }, { GLUE_STORE_TURN_ENABLED: "false" }).enabled, true, "config.enabled=true 不被 env=false 覆盖");
+  // config 显式关：enabled=false → 关（env=true 不得覆盖）
+  assert.equal(resolveStoreConfig({ storeTurn: { enabled: false } }, { GLUE_STORE_TURN_ENABLED: "true" }).enabled, false, "config.enabled=false 显式关，env=true 不覆盖");
+  // env fallback：config 未设时 env 严格 "true" 才开
+  assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: "true" }).enabled, true, "config 未设 + env='true' → 开（fallback）");
   assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: "TRUE" }).enabled, false, "'TRUE' 不开（严格小写 true）");
   assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: "1" }).enabled, false, "'1' 不开");
   assert.equal(resolveStoreConfig({}, { GLUE_STORE_TURN_ENABLED: "" }).enabled, false, "空串不开");
+  // 弃用标记已移除（config.enabled 重新权威，无 deprecated 概念）
+  assert.equal(resolveStoreConfig({ storeTurn: { enabled: true } }, {}).configEnabledDeprecated, undefined, "configEnabledDeprecated 已移除");
 });
 
 await okAsync("storeTurnFromGlue：200 → ok + 透传 stored/dedup_hit", async () => {
@@ -505,13 +505,21 @@ await okAsync("handleAgentEnd：默认关 → 不写（STORE-SKIP plugin-disable
       { messages: MSGS_NORMAL, success: true, context: {} },
       { runId: "r1", sessionId: "main" },
       { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: false } } },
-      {}, // env 未设 → 关（config.enabled=false 本就无关）
+      { GLUE_STORE_TURN_ENABLED: "true" }, // config 显式关：env=true 也不得覆盖
+    );
+    assert.equal(state.requests.length, 0, "config.enabled=false 必须零请求（env 不覆盖）");
+    // 全未设（config 无 storeTurn + env 未设）→ 同样零请求
+    await handleAgentEnd(
+      { messages: MSGS_NORMAL, success: true, context: {} },
+      { runId: "r1b", sessionId: "main" },
+      { pluginConfig: { glueUrl: `http://127.0.0.1:${port}` } },
+      {},
     );
     assert.equal(state.requests.length, 0, "默认关必须零请求");
   } finally { server.close(); }
 });
 
-await okAsync("handleAgentEnd：config.enabled=true 但 env 未设 → 不写 + 弃用标记（防静默）", async () => {
+await okAsync("handleAgentEnd：config.enabled=true（env 未设）→ 写入（config 优先开闸）", async () => {
   _resetFingerprintForTest();
   const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
   try {
@@ -519,9 +527,9 @@ await okAsync("handleAgentEnd：config.enabled=true 但 env 未设 → 不写 + 
       { messages: MSGS_NORMAL, success: true, context: {} },
       { runId: "r2", sessionId: "main" },
       { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true } } },
-      {}, // env 未设：config.enabled=true 已被弃用，不得开闸
+      {}, // env 未设：config.storeTurn.enabled=true 即为开关（schema 合法路径）
     );
-    assert.equal(state.requests.length, 0, "旧配置路径不得开闸（零请求）");
+    assert.equal(state.requests.length, 1, "config 开闸应写入 1 次");
   } finally { server.close(); }
 });
 
@@ -529,8 +537,8 @@ await okAsync("handleAgentEnd：四闸跳过（心跳/子代理/cron/失败轮�
   _resetFingerprintForTest();
   const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
   try {
-    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { minIntervalMs: 0 } } };
-    const env = { GLUE_STORE_TURN_ENABLED: "true" }; // 开关 = env（config→env 修复）
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    const env = {}; // 开关 = config.storeTurn.enabled（config 优先路径）
     await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "h", sessionId: "main", trigger: "heartbeat" }, api, env);
     await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "s", sessionId: "main", sessionKey: "agent:main:subagent:abc" }, api, env);
     await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "c", sessionId: "main", jobId: "job-1", trigger: "cron" }, api, env);
@@ -539,14 +547,14 @@ await okAsync("handleAgentEnd：四闸跳过（心跳/子代理/cron/失败轮�
   } finally { server.close(); }
 });
 
-await okAsync("handleAgentEnd：正常轮 → 写入 + seq 递增 + 指纹防双 fire", async () => {
+await okAsync("handleAgentEnd：正常轮 → 写入 + seq 递增 + 指纹防双 fire（config 开闸）", async () => {
   _resetFingerprintForTest();
   const { server, port, state } = await startMockStoreTurn({
     resp: { session_id: "main", turn_count: 127, stored: true, dedup_hit: false, core_chars: 30, gray: false },
   });
   try {
-    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { minIntervalMs: 0 } } };
-    const env = { GLUE_STORE_TURN_ENABLED: "true" }; // 开关 = env
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    const env = {}; // 开关 = config.storeTurn.enabled
     // 同 runId 双 fire（嵌入式重试循环模拟，M-2）→ 第二次指纹拦截
     await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-A", sessionId: "main" }, api, env);
     await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "run-A", sessionId: "main" }, api, env);
