@@ -9,6 +9,15 @@
 // 回魂仪式（2026-08-05）：每次会话注入固定附带【回魂】段（自我快照）——
 //   自述（LMS self_ref）/ 状态（熵/惊讶/目的一致性）/ 最近（沙漏最新记忆）。
 //   放在 [记忆注入] 块之前（≤300 字）；/soul 故障时静默降级为旧行为。
+//
+// 阶段 1 六层注入改造（2026-08-13，设计 v1.1 §三 注入链）：
+//   ①[回魂]状态块（保留） ②景观叙事（解读段扩权，非纯数字）
+//   ③thought notes 占位（阶段 2 思考链） ④焦点记忆 3-5 条（Cowan 4±1，
+//   滤伪相关，带来源+置信度标注） ⑤质疑层（置信度/来源维度）
+//   ⑥行动层占位（阶段 4）。注入块 ≤800 字硬约束。
+//   数据源缺口：attractor.get_landscape() 可序列化但无 HTTP 端点（api/
+//   server.py、control.py 均无 /landscape）——阶段 1 用 /react 解读段 +
+//   reaction 派生 + /soul 状态兜底拼景观叙事；新端点列入阶段 2 变更申报。
 
 import { appendFileSync } from "node:fs";
 
@@ -21,9 +30,15 @@ const SOUL_TIMEOUT_MS = 4000;
 // 体验层 A：/react 实时反应同样走 4s 快路径（infer-only，k=0 轻量）。
 const REACT_TIMEOUT_MS = 4000;
 const QUERY_MAX_CHARS = 200;     // 查询取当前用户消息前 200 字
-const SOUL_MAX_CHARS = 150;      // 【回魂】段字数上限（2026-08-05 压缩：去重+限条数，控 token）
+const SOUL_MAX_CHARS = 200;      // 【回魂】段字数上限（2026-08-05 压缩：去重+限条数；
+                                 // 2026-08-13 阶段1 景观叙事扩权：解读段 ≤200 字，设计 v1.1 §三-2）
 // 体验层 A：限流轮轻量解读段上限（设计 v1.1 §3.4：≤150 字）
 const LIGHT_MAX_CHARS = 150;
+// 阶段 1 六层注入：焦点记忆容量（Cowan 2001 注意焦点 4±1 → 3-5 条）
+const FOCUS_MAX_ITEMS = 5;
+// 注入块 ≤800 字硬约束（lost-in-the-middle 2307.03172：短块内位置效应可控；
+// 超出走 composeContext 截断保活——[回魂] 段永不先截，先截记忆块尾部）
+const INJECT_MAX_CHARS = 800;
 
 // ----------------------------------------------------------------------
 // 召回L1-a（2026-08-11）：query 净化 —— 复刻 openclaw 自带 stripInboundMetadata
@@ -207,13 +222,15 @@ export function resolveConfig(pluginConfig) {
   return {
     enabled: cfg.enabled !== false,
     glueUrl: typeof cfg.glueUrl === "string" && cfg.glueUrl ? cfg.glueUrl : GLUE_DEFAULT_URL,
-    k: Number.isFinite(cfg.k) ? Math.max(1, Math.min(20, Math.floor(cfg.k))) : 8,
+    // 阶段 1：焦点记忆 3-5 条（Cowan 4±1 容量锚点），不再默认 8 条；
+    // 显示层另有 FOCUS_MAX_ITEMS=5 硬顶兜底（即使配置 k>5）
+    k: Number.isFinite(cfg.k) ? Math.max(1, Math.min(20, Math.floor(cfg.k))) : 5,
     minIntervalMs: Number.isFinite(cfg.minIntervalMs)
       ? Math.max(0, Math.floor(cfg.minIntervalMs))
       : 2000,
     maxChars: Number.isFinite(cfg.maxChars)
       ? Math.max(200, Math.min(4000, Math.floor(cfg.maxChars)))
-      : 1500,
+      : INJECT_MAX_CHARS,
     soulEnabled: cfg.soulEnabled !== false,
     soulMaxChars: Number.isFinite(cfg.soulMaxChars)
       ? Math.max(100, Math.min(800, Math.floor(cfg.soulMaxChars)))
@@ -306,13 +323,121 @@ export async function fetchSoul(cfg) {
 }
 
 /**
- * 把 /soul 响应整理为【回魂】段（≤maxChars，默认 300）。
- * 格式：`[回魂] 自述:… / 状态:熵0.95 惊讶0.11 目的0.92 / 解读:… / 最近:…`
+ * ② 景观叙事（阶段 1 六层注入，设计 v1.1 §三-2）——解读段扩权。
+ *
+ * 数据源（阶段 1 可用，均经 glue 只读端点，实测字段）：
+ *   - /react interpretation：LMS 解码器自然语言解读（"什么在激活"主体）
+ *   - /react reaction.surprise_z：惊讶涨落方向（>1 上升 / <-1 回落 / 平稳）
+ *   - /react reaction.coherence｜/soul lms_state.purpose_coherence：目的稳定性
+ *   - /soul lms_state.entropy_ratio / last_surprise：解读段缺席时的派生兜底
+ *
+ * 缺口（阶段 2 变更申报）：attractor.get_landscape() 可序列化但无 HTTP
+ * 端点（api/server.py、api/control.py 均无 /landscape）——盆地结构/激活
+ * 主题竞争拿不到；新端点列入阶段 2，本阶段不新增 LMS 端点（硬约束）。
+ *
+ * 输出叙事（非纯数字）或 null（无任何数据源可用，fail-open）。
+ */
+function buildLandscapeNarrative(reactData, soulData) {
+  const react =
+    reactData && typeof reactData === "object" && reactData.reaction
+      ? reactData.reaction
+      : {};
+  const st =
+    soulData && typeof soulData === "object" && soulData.lms_state
+      ? soulData.lms_state
+      : {};
+  const clauses = [];
+
+  // 1) 解读段（自然语言，前 2 句）——"什么在激活"的主体叙事
+  const interp =
+    reactData && typeof reactData.interpretation === "string"
+      ? reactData.interpretation.trim()
+      : "";
+  const interpClauses = interp.split("｜").map((s) => s.trim()).filter(Boolean);
+  if (interpClauses.length > 0) {
+    clauses.push(interpClauses.slice(0, 2).join("｜"));
+  } else {
+    // 解读段缺席（/react 失败/降级）→ 从状态数字派生基础叙事（fail-open）
+    const entropyRatio = typeof react.entropy_ratio === "number"
+      ? react.entropy_ratio
+      : (typeof st.entropy_ratio === "number" ? st.entropy_ratio : null);
+    if (entropyRatio !== null) {
+      clauses.push(
+        entropyRatio >= 0.8 ? "高唤醒·多模式扩散"
+          : entropyRatio >= 0.4 ? "中等激活"
+            : "低唤醒·单模式聚焦",
+      );
+    }
+  }
+
+  // 2) 惊讶涨落方向（解读段通常不覆盖；z 分优先，绝对等级兜底）
+  const surpriseZ = typeof react.surprise_z === "number" ? react.surprise_z : null;
+  if (surpriseZ !== null) {
+    clauses.push(surpriseZ > 1 ? "惊讶上升" : surpriseZ < -1 ? "惊讶回落" : "惊讶平稳");
+  } else if (typeof st.last_surprise === "number") {
+    clauses.push(st.last_surprise > 20 ? "惊讶偏高" : st.last_surprise > 5 ? "惊讶中等" : "惊讶偏低");
+  }
+
+  // 3) 目的稳定性
+  const coherence = typeof react.coherence === "number"
+    ? react.coherence
+    : (typeof st.purpose_coherence === "number" ? st.purpose_coherence : null);
+  if (coherence !== null) {
+    clauses.push(coherence >= 0.7 ? "目的稳定" : "目的漂移");
+  }
+
+  if (clauses.length === 0) return null;
+  return `景观:${clauses.join("｜")}`;
+}
+
+/**
+ * ⑤ 质疑层（阶段 1 六层注入，设计 v1.1 §三-5）——"当前在怀疑什么"。
+ *
+ * 阶段 1 数据源（保守表述，不臆测；无可用信号 → 返回 null 不注入行）：
+ *   - 协同分 spread（results[].scores.total）：分差小 → 排序不可靠，
+ *     伪相关风险（Power of Noise 2401.14887：高分无关条目最毒）
+ *   - 来源维度（results[].origin）：archive=归档较旧，置信度低于活体
+ *   - 全局 precision（/react reaction.precision_mean）：怀疑水位高低
+ *   - 候选完全无协同分 → 显式声明"置信度不可考"（而非假装可信）
+ *
+ * 注：lms_activation 恒 1.0 是 glue 对 LMS 命中条目的设计值（integration_
+ * service.py 4b：LMS 命中即满激活），非区分信号，不作为怀疑依据。
+ */
+function buildDoubtLayer(results, reactData) {
+  if (!Array.isArray(results)) return null;
+  const doubts = [];
+
+  const scored = results.filter((it) => it && typeof it.scores?.total === "number");
+  if (scored.length >= 2) {
+    const totals = scored.map((it) => it.scores.total);
+    const spread = Math.max(...totals) - Math.min(...totals);
+    if (spread <= 0.05) doubts.push("协同分接近（≤0.05），伪相关风险需甄别");
+  } else if (scored.length === 0) {
+    doubts.push("候选未带协同分，置信度不可考（以景观激活为准）");
+  }
+
+  if (results.some((it) => it && it.origin === "archive")) {
+    doubts.push("含归档条目（较旧，置信度低于活体）");
+  }
+
+  const precision = reactData?.reaction?.precision_mean;
+  if (typeof precision === "number") {
+    if (precision < 0.6) doubts.push(`全局precision偏低（${precision.toFixed(2)}），怀疑水位上调`);
+    else if (precision > 0.9) doubts.push(`全局precision偏高（${precision.toFixed(2)}），怀疑水位偏低`);
+  }
+
+  if (doubts.length === 0) return null;
+  return `[质疑] ${doubts.slice(0, 2).join("；")}`; // 预算纪律：最多 2 条信号
+}
+
+/**
+ * 把 /soul 响应整理为【回魂】段（≤maxChars，默认 200）。
+ * 阶段 1 六层：① 状态块 + ② 景观叙事 + ③ thought 占位 + 自述/最近（保留）。
+ * 格式：`[回魂] 自述:… / 状态:熵0.95 惊讶0.11 目的0.92 / 景观:… / thought:… / 最近:…`
  * 无有效字段/异常结构 → 返回 null。
  *
  * @param {object|null} reactData 体验层 A：/react 响应（可选）。在场时把
- *   记忆状态解读段追加进【回魂】（≤80 字，取前 2 句）——"大脑此刻的感受"
- *   随注入送达（设计 v1.1 §3.4：解读段放截断保活区，永不先截）。
+ *   记忆状态解读段扩权为景观叙事（设计 v1.1 §3.4：解读段放截断保活区，永不先截）。
  */
 export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null) {
   // data 为 null = 未启用/请求失败（原因已在 postJson 记 MISS），此处不重复记
@@ -337,20 +462,11 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null)
   if (typeof st.turn_count === "number") stBits.push(`轮次${st.turn_count}`);
   if (stBits.length > 0) parts.push(`状态:${stBits.join(" ")}`);
 
-  // 3. 体验层 A：记忆状态解读（/react 实时反应的自然语言段）
-  //    追加在状态之后、最近之前；≤80 字，取前 2 句（｜ 分隔）。
-  //    /react 失败（reactData null）时跳过——逐字节兼容旧行为。
-  if (reactData && typeof reactData === "object") {
-    const interp = typeof reactData.interpretation === "string"
-      ? reactData.interpretation.trim()
-      : "";
-    if (interp) {
-      const sentences = interp.split("｜").map((s) => s.trim()).filter(Boolean);
-      let interpText = sentences.slice(0, 2).join("｜");
-      if (interpText.length > 80) interpText = `${interpText.slice(0, 80)}…`;
-      parts.push(`解读:${interpText}`);
-    }
-  }
+  // ② 景观叙事（解读段扩权，设计 v1.1 §三-2）：描述"当前记忆状态"——
+  //    什么在激活 / 惊讶涨落 / 目的稳定性（非纯数字，≤200 字预算内）。
+  //    /react 失败（reactData null）时退化为从 lms_state 派生（fail-open）。
+  const landscape = buildLandscapeNarrative(reactData, data);
+  if (landscape) parts.push(landscape);
 
   // 4. 最近（沙漏最新记忆）：去重 + 最多 2 条
   const recents = Array.isArray(data.recent)
@@ -371,19 +487,26 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null)
     logMiss("soul-empty-fields"); // P0-1：有响应但无可用字段
     return null;
   }
+  // ③ thought notes 占位（阶段 2 思考链；本阶段仅预留结构字段，不产出内容）
+  //    仅在回魂段有真实内容时追加——保持空数据 → null 的 fail-open 语义。
+  parts.push("thought:无（阶段2占位）");
   let out = `[回魂] ${parts.join(" / ")}`;
   if (out.length > maxChars) out = `${out.slice(0, maxChars)}…`;
   return out;
 }
 
 /**
- * 把 /recall 响应整理为注入文本（≤maxChars）。
- * 响应结构（glue_server.py 实测）：{query, count, results:[...], self_ref:[自述]}
+ * 把 /recall 响应整理为注入文本（≤maxChars）——阶段 1 六层注入的 ④⑤⑥ 层：
+ * 焦点记忆（3-5 条，Cowan 4±1）+ 质疑层 + 行动层占位。
+ * 响应结构（glue_server.py 实测）：{query, count, results:[{id,text,origin,
+ * scores:{text,vector,lms_activation,total}, lms:{…}}], self_ref:[自述]}
  * 无结果/异常结构 → 返回 null。
  *
  * @param {boolean} skipSelfRef 已注入【回魂】段时跳过 [记忆系统自述]（防重复）。
+ * @param {object|null} reactData 体验层 A：/react 响应（可选）——质疑层的
+ *   全局 precision 信号来源；缺席时质疑层仅用条目自身信号（向后兼容）。
  */
-export function buildContextText(data, query, maxChars, skipSelfRef = false) {
+export function buildContextText(data, query, maxChars, skipSelfRef = false, reactData = null) {
   if (!data || typeof data !== "object") {
     logMiss("recall-invalid-response"); // P0-1：/recall 响应结构异常
     return null;
@@ -394,17 +517,38 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false) {
     return null;
   }
 
-  const lines = [`[记忆注入] 按"${String(query).slice(0, 60)}"召回 ${results.length} 条相关记忆：`];
-  for (const [i, it] of results.entries()) {
+  // ④ 焦点记忆：3-5 条（Cowan 4±1），精确去重（滤伪相关：同文不重复注入）
+  const items = [];
+  const seenTexts = new Set();
+  for (const it of results) {
     const text = typeof it?.text === "string" ? it.text.trim().replace(/\s+/g, " ") : "";
-    if (!text) continue;
-    const origin = typeof it?.origin === "string" && it.origin ? `[${it.origin}]` : "";
-    lines.push(`${i + 1}. ${origin} ${text}`);
+    if (!text || seenTexts.has(text)) continue;
+    seenTexts.add(text);
+    items.push({
+      text,
+      origin: typeof it?.origin === "string" && it.origin ? it.origin : "",
+      score: typeof it?.scores?.total === "number" ? it.scores.total : null,
+    });
+    if (items.length >= FOCUS_MAX_ITEMS) break;
   }
-  if (lines.length === 1) {
+  if (items.length === 0) {
     logMiss("recall-no-usable-text"); // P0-1：命中条目均无可注入文本
     return null;
   }
+
+  const lines = [`[记忆注入] 焦点记忆 ${items.length} 条（按"${String(query).slice(0, 60)}"激活加权召回）：`];
+  for (const [i, it] of items.entries()) {
+    // 来源 + 置信度标注（质疑层基础）：[origin·分total]；无分时仅标来源
+    const meta = it.origin
+      ? `[${it.origin}${it.score !== null ? `·分${it.score.toFixed(2)}` : ""}]`
+      : "";
+    lines.push(`${i + 1}. ${meta} ${it.text}`);
+  }
+
+  // ⑤ 质疑层 + ⑥ 行动层占位（阶段 4 实现）
+  const doubt = buildDoubtLayer(results, reactData);
+  if (doubt) lines.push(doubt);
+  lines.push("[行动] 无（阶段4占位）");
 
   // 反思回流：附加记忆系统最近自述（LMS self_ref 产物）；
   // 回魂段已含自述时跳过，避免重复占用上下文预算。
@@ -417,7 +561,35 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false) {
 
   let joined = lines.join("\n");
   if (joined.length > maxChars) {
-    joined = `${joined.slice(0, maxChars)}…（截断）`;
+    // 六层保结构截断（阶段 1）：先压缩条目文本，保留头部/质疑/行动层完整
+    // （lost-in-the-middle：关键结构不埋在截断区；⑤⑥ 层不能先截）。
+    // 目标 = maxChars - 2：留安全边距，避免 composeContext 的标记截断
+    // （其 memBudget = maxChars - soul - 2，标记预留 5 字）恰好压线触发。
+    const target = maxChars - 2;
+    const itemIdxs = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      if (/^\d+\. /.test(lines[i])) itemIdxs.push(i);
+    }
+    if (itemIdxs.length > 0) {
+      const origLines = lines.slice();
+      const overflow = joined.length - target;
+      // 每轮从原行多砍 1 字（"…" 补回 1 字，净减 per-1）；短条目触底
+      // （保留行号+来源/置信度前缀 ≥20 字）后由后续轮次继续压长条目。
+      let per = Math.ceil(overflow / itemIdxs.length);
+      for (let round = 0; round < 10 && joined.length > target; round += 1) {
+        per += 1;
+        for (const i of itemIdxs) {
+          const line = origLines[i];
+          const cut = Math.min(Math.max(line.length - 20, 0), per);
+          if (cut > 0) lines[i] = `${line.slice(0, line.length - cut)}…`;
+        }
+        joined = lines.join("\n");
+      }
+    }
+    if (joined.length > maxChars) {
+      // 极端兜底（条目全部触底仍超限）：整体截断
+      joined = `${joined.slice(0, maxChars)}…（截断）`;
+    }
   }
   return joined;
 }
@@ -512,9 +684,11 @@ export async function buildMemoryContext(prompt, pluginConfig) {
 
     // 【回魂】段（≤soulMaxChars），优先于记忆块；解读段经 reactData 追加
     const soulText = buildSoulText(soulData, cfg.soulMaxChars, reactData);
-    // 记忆块预算 = 总量 - 回魂段已占字数（回魂段含自述时跳过 [记忆系统自述]）
-    const memoryBudget = Math.max(200, cfg.maxChars - (soulText ? soulText.length : 0));
-    const memoryText = buildContextText(recallData, query, memoryBudget, Boolean(soulText));
+    // 记忆块预算 = 总量 - 回魂段 - "\n\n" 分隔符（与 composeContext 的
+    // keep=soulText.length+2 对齐，避免 compose 二次截断吃掉尾部结构层）
+    const memoryBudget = Math.max(200, cfg.maxChars - (soulText ? soulText.length + 2 : 0));
+    // reactData 透传给 buildContextText：质疑层需要全局 precision 信号
+    const memoryText = buildContextText(recallData, query, memoryBudget, Boolean(soulText), reactData);
 
     return composeContext(soulText, memoryText, cfg.maxChars);
   } catch (err) {

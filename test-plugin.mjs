@@ -129,7 +129,10 @@ await okAsync("截断：超过 maxChars 被截断", async () => {
       maxChars: 300,
     });
     assert.ok(text.length <= 300 + 10, `应 ≤300（含截断标记），实际 ${text.length}`);
-    assert.ok(text.endsWith("（截断）"), "应以截断标记结尾");
+    // 阶段 1（2026-08-13）：截断契约从"尾部切片"升级为"保结构压缩条目"——
+    // 超限时压缩条目文本（以 … 标记），保留头部/质疑/行动层结构完整；
+    // 条目全部触底仍超限的极端情况才整体截断（以 （截断） 标记）。
+    assert.ok(text.includes("…"), "应含条目截断标记");
   } finally {
     server.close();
   }
