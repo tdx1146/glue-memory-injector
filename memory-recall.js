@@ -12,14 +12,14 @@
 //
 // 阶段 1 六层注入改造（2026-08-13，设计 v1.1 §三 注入链）：
 //   ①[回魂]状态块（保留） ②景观叙事（解读段扩权，非纯数字）
-//   ③thought notes 占位（阶段 2 思考链） ④焦点记忆 3-5 条（Cowan 4±1，
-//   滤伪相关，带来源+置信度标注） ⑤质疑层（置信度/来源维度）
-//   ⑥行动层占位（阶段 4）。注入块 ≤800 字硬约束。
-//   数据源缺口：attractor.get_landscape() 可序列化但无 HTTP 端点（api/
-//   server.py、control.py 均无 /landscape）——阶段 1 用 /react 解读段 +
-//   reaction 派生 + /soul 状态兜底拼景观叙事；新端点列入阶段 2 变更申报。
+//   ③thought notes（阶段 2 思考链接线：读 thoughts.jsonl 按激活度取 1-2 条）
+//   ④焦点记忆 3-5 条（Cowan 4±1，滤伪相关，带来源+置信度标注） ⑤质疑层 ⑥行动层
+//     （阶段 4 已实现：激活 thought 的行动意向四问 + 分级；只展示不执行）
+//   注入块 ≤800 字硬约束。
+//   数据源缺口（阶段 1 记录）：attractor.get_landscape() 无 HTTP 端点——阶段 2
+//   已新增 LMS GET /landscape/{sid}（只读、fail-open，见 api/server.py）。
 
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 
 const GLUE_DEFAULT_URL = "http://127.0.0.1:19000";
 // P0-1 止血：单次 HTTP 超时 4000 → 15000。慢后端（跨机 bge-m3 向量 / LMS /recall）
@@ -30,7 +30,10 @@ const SOUL_TIMEOUT_MS = 4000;
 // 体验层 A：/react 实时反应同样走 4s 快路径（infer-only，k=0 轻量）。
 const REACT_TIMEOUT_MS = 4000;
 const QUERY_MAX_CHARS = 200;     // 查询取当前用户消息前 200 字
-const SOUL_MAX_CHARS = 200;      // 【回魂】段字数上限（2026-08-05 压缩：去重+限条数；
+// 阶段 2 思考链（2026-08-13）：回魂段预算 200 → 300——③ thought notes 层
+// （1-2 条 × ≤90 字）需要空间；总注入仍 ≤800（composeContext 保结构截断，
+// 记忆块吸收超出，[回魂] 段永不先截）。
+const SOUL_MAX_CHARS = 300;      // 【回魂】段字数上限（2026-08-05 压缩：去重+限条数；
                                  // 2026-08-13 阶段1 景观叙事扩权：解读段 ≤200 字，设计 v1.1 §三-2）
 // 体验层 A：限流轮轻量解读段上限（设计 v1.1 §3.4：≤150 字）
 const LIGHT_MAX_CHARS = 150;
@@ -39,6 +42,30 @@ const FOCUS_MAX_ITEMS = 5;
 // 注入块 ≤800 字硬约束（lost-in-the-middle 2307.03172：短块内位置效应可控；
 // 超出走 composeContext 截断保活——[回魂] 段永不先截，先截记忆块尾部）
 const INJECT_MAX_CHARS = 800;
+// ── 阶段 2 思考链：thought notes 接线（2026-08-13，设计 v1.1 §三-3）──
+// 读 thoughts.jsonl（思考链产物流）最近 N 条，按"与当前对话的激活度"
+// （字符 bigram 覆盖度，关键词法；设计允许 "embed 相似度或关键词"——注入
+// 热路径不加 embed 网络调用）取 1-2 条注入；激活度低于阈值则不注入
+// （设计："当前对话激活了哪个 thought 注入哪个；未激活不注入"）。
+const THOUGHTS_FILE =
+  "/vol2/1000/AI专用/所有自动化/轻如烟/memory/thoughts.jsonl";
+const THOUGHTS_MAX_ITEMS = 10;   // 回看窗口（最近 N 条）
+// P1-4（审计 2026-08-14）：thought 注入面 ≤90 → ≤60 字/条。注入的是摘要
+// （全文在 thoughts.jsonl）；配合 P1-2 去重（同文本只注 1 条）+ 单条上限，
+// 回魂段内「最近」记忆不再被 thought 层挤压丢失（审计实测 798/800 顶格、
+// 回魂段 301 必截）。
+const THOUGHT_MAX_CHARS = 60;    // 注入面摘要（全文在 thoughts.jsonl）
+// P1-2：激活度评分窗 = 90 字（thought 主旨通常在前 90 字；审计实测相关 query
+// 对 90 字形态 0.0521、对 60 字前缀仅 0.028——注入内容（≤60）是评分窗
+// （≤90）的前缀，不存在“注入未评分内容”的错配）。
+const THOUGHT_ACTIVATION_CHARS = 90;
+// P1-4：注入条数 1-2 → 1（预算纪律：2 条 × 60 字 + 主题 + 分隔符 ≈ 140 字，
+// 叠加自述/状态/景观后回魂段仍会超 300 截断，丢「最近」；1 条 ≈ 70 字保底）。
+const THOUGHT_INJECT_MIN = 1;    // 1 条（P1-4 预算重分配后）
+const THOUGHT_INJECT_MAX = 1;
+// P1-4（审计 2026-08-14）：注入预算余量保护——总量按 800-40=760 执行，
+// 任何字数波动不再触发压线截断（旧实现 798/800，余量 2 字）。
+const COMPOSE_MARGIN = 40;
 
 // ----------------------------------------------------------------------
 // 召回L1-a（2026-08-11）：query 净化 —— 复刻 openclaw 自带 stripInboundMetadata
@@ -70,6 +97,13 @@ const TEMPLATE_PREFIX_RE = /^\s*(?:\[[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}[^
 // 心跳 poll / 子代理指令正文 / 跨会话仅剩来源参数 —— 无真实用户内容
 const HEARTBEAT_POLL_RE = /heartbeat\s*poll|Read HEARTBEAT\.md/i;
 const SUBAGENT_BODY_RE = /You are running as a subagent|Results auto-announce to your requester|do not busy-poll for status|\[Subagent Task\]/i;
+// P1-3（审计 2026-08-14）：中文隔离子代理模板黑名单。openclaw 自带英文
+// SUBAGENT_BODY_RE 覆盖不到自研中文模板（think_loop DEEP_PROMPT_TEMPLATE
+// 「后台思考者」/ night_patrol「时间旁观者」）——explicit:think-* /
+// explicit:night-* 会话 isSub=false 漏拦，795 字记忆注入进子代理上下文
+// （审计实测 glue-hook-debug.log INJECTED len=795，sessionKey=
+// agent:main:explicit:think-*）。与 subagent 闸同款：命中即不注入（null）。
+const CN_ISOLATED_AGENT_RE = /后台思考者|时间旁观者|隔离子代理，独立上下文|read \/tmp\/think_input\.json|read \/tmp\/night_patrol_input\.json/;
 const INTERSESSION_META_ONLY_RE = /^sourceSession=/i;
 
 function isInboundMetaSentinelLine(line) {
@@ -183,6 +217,7 @@ export function extractQueryText(prompt) {
     if (!text) return null; // 纯元数据/纯模板 → 不注入
     if (HEARTBEAT_POLL_RE.test(text)) return null;
     if (SUBAGENT_BODY_RE.test(text)) return null;
+    if (CN_ISOLATED_AGENT_RE.test(text)) return null; // P1-3：中文隔离子代理模板
     if (INTERSESSION_META_ONLY_RE.test(text)) return null;
     return text.slice(0, QUERY_MAX_CHARS);
   } catch {
@@ -235,6 +270,12 @@ export function resolveConfig(pluginConfig) {
     soulMaxChars: Number.isFinite(cfg.soulMaxChars)
       ? Math.max(100, Math.min(800, Math.floor(cfg.soulMaxChars)))
       : SOUL_MAX_CHARS,
+    // 阶段 2 思考链：thought 注入开关 + 激活度阈值（默认 0.05≈共享 ~8 字
+    // 片段=真实主题关联；阈值无文献【待灰度】，灰度期观测定参）
+    thoughtEnabled: cfg.thoughtEnabled !== false,
+    thoughtActivationMin: Number.isFinite(cfg.thoughtActivationMin)
+      ? Math.max(0, Math.min(1, cfg.thoughtActivationMin))
+      : 0.05,
   };
 }
 
@@ -243,6 +284,11 @@ export function _resetRateLimitForTest() {
   lastCallAt = 0;
   inflight = false;
 }
+
+// 阶段 3（precision 三层动态化）：质疑层数据源函数导出（供 test-plugin.mjs
+// 直接单测——纯函数，零副作用；导出不改变任何行为）。阶段 4：行动层
+// buildActionLayer 已随函数声明导出（见下，不在此重复导出）。
+export { parseConfidenceTag, buildDoubtLayer };
 
 // 仅供测试：读取限流状态
 export function _getRateLimitStateForTest() {
@@ -391,43 +437,207 @@ function buildLandscapeNarrative(reactData, soulData) {
 }
 
 /**
- * ⑤ 质疑层（阶段 1 六层注入，设计 v1.1 §三-5）——"当前在怀疑什么"。
+ * ⑤ 质疑层（阶段 1 六层注入 + 阶段 3 数据源切换，设计 v1.1 §三-5）——"当前在怀疑什么"。
  *
- * 阶段 1 数据源（保守表述，不臆测；无可用信号 → 返回 null 不注入行）：
- *   - 协同分 spread（results[].scores.total）：分差小 → 排序不可靠，
- *     伪相关风险（Power of Noise 2401.14887：高分无关条目最毒）
- *   - 来源维度（results[].origin）：archive=归档较旧，置信度低于活体
- *   - 全局 precision（/react reaction.precision_mean）：怀疑水位高低
- *   - 候选完全无协同分 → 显式声明"置信度不可考"（而非假装可信）
+ * 阶段 3（precision 三层动态化，2026-08-14）：数据源从"协同分接近启发式
+ * + 固定 precision 阈值"切换为**真实 precision**（质疑自动校准）：
+ *   - 全局怀疑水位：reactData.reaction.doubt.baseline（HGF 波动性调制，
+ *     0-1 连续量；波动↑→怀疑↑→precision↓；非固定阈值）
+ *   - 分位怀疑线：reactData.reaction.doubt.threshold（conformal 分位，
+ *     被反驳条目反驳前置信度分布 P85，随经验分布漂移）——条目置信度
+ *     低于此线 → "这条该被怀疑"
+ *   - 条目置信度：解析 LMS 侧真实置信度标注（⚠️置信N.N[驳M]，集成层对
+ *     confidence<0.5 的 LMS 命中条目已注解，源自条目 confidence 字段）
+ *   - 来源维度保留：origin=archive（来源可信度，Sperber 2010 D3）
  *
- * 注：lms_activation 恒 1.0 是 glue 对 LMS 命中条目的设计值（integration_
- * service.py 4b：LMS 命中即满激活），非区分信号，不作为怀疑依据。
+ * 零固定阈值：判定全部用动态值（baseline/threshold）；无 precision 信号
+ * （开关关/冷启动/接口失败）→ 回退旧行为（协同分接近启发式），并显式
+ * 声明"置信度不可考"（不假装可信）。
  */
+const CONF_TAG_RE = /⚠️置信([\d.]+)(?:驳(\d+))?/;
+function parseConfidenceTag(text) {
+  const m = CONF_TAG_RE.exec(String(text || ""));
+  if (!m) return null;
+  const c = parseFloat(m[1]);
+  return Number.isFinite(c) ? c : null;
+}
 function buildDoubtLayer(results, reactData) {
   if (!Array.isArray(results)) return null;
   const doubts = [];
+  const doubt = reactData?.reaction?.doubt;
+  const hasRealPrecision = doubt && typeof doubt.baseline === "number" && !doubt.cold;
 
-  const scored = results.filter((it) => it && typeof it.scores?.total === "number");
-  if (scored.length >= 2) {
-    const totals = scored.map((it) => it.scores.total);
-    const spread = Math.max(...totals) - Math.min(...totals);
-    if (spread <= 0.05) doubts.push("协同分接近（≤0.05），伪相关风险需甄别");
-  } else if (scored.length === 0) {
-    doubts.push("候选未带协同分，置信度不可考（以景观激活为准）");
+  if (hasRealPrecision) {
+    // 全局怀疑水位（HGF 波动性调制的动态基线：>0.5 偏高，<0.5 偏低）
+    const bl = doubt.baseline;
+    if (bl >= 0.5) {
+      doubts.push(`全局怀疑水位偏高（动态基线${bl.toFixed(2)}，环境波动↑）`);
+    } else {
+      doubts.push(`全局怀疑水位偏低（动态基线${bl.toFixed(2)}，环境稳定）`);
+    }
+    // 分位怀疑线：条目置信度 < 动态阈值 → 该被怀疑（conformal 分位判定）
+    const thr = typeof doubt.threshold === "number" ? doubt.threshold : null;
+    if (thr !== null) {
+      for (const it of results) {
+        const conf = parseConfidenceTag(it?.text);
+        if (conf !== null && conf < thr) {
+          const q = typeof doubt.threshold_quantile === "number"
+            ? `P${Math.round(doubt.threshold_quantile * 100)}`
+            : "动态分位";
+          doubts.push(`条目置信${conf.toFixed(2)}低于动态怀疑线${q}(${thr.toFixed(2)})`);
+          break; // 预算纪律：最多 2 条信号
+        }
+      }
+    }
+  } else {
+    // 无 precision 信号（开关关/冷启动/接口失败）→ 旧行为回退：
+    // 协同分 spread 启发式 + 显式声明不可考（不假装可信）
+    const scored = results.filter((it) => it && typeof it.scores?.total === "number");
+    if (scored.length >= 2) {
+      const totals = scored.map((it) => it.scores.total);
+      const spread = Math.max(...totals) - Math.min(...totals);
+      if (spread <= 0.05) doubts.push("协同分接近（≤0.05），伪相关风险需甄别");
+    } else if (scored.length === 0) {
+      doubts.push("候选未带置信度，置信度不可考（以景观激活为准）");
+    }
   }
 
+  // 来源维度（Sperber 2010：来源可信度独立评估——审外/审己在记忆层合一）
   if (results.some((it) => it && it.origin === "archive")) {
-    doubts.push("含归档条目（较旧，置信度低于活体）");
-  }
-
-  const precision = reactData?.reaction?.precision_mean;
-  if (typeof precision === "number") {
-    if (precision < 0.6) doubts.push(`全局precision偏低（${precision.toFixed(2)}），怀疑水位上调`);
-    else if (precision > 0.9) doubts.push(`全局precision偏高（${precision.toFixed(2)}），怀疑水位偏低`);
+    doubts.push("含归档条目（来源较旧，置信度低于活体）");
   }
 
   if (doubts.length === 0) return null;
   return `[质疑] ${doubts.slice(0, 2).join("；")}`; // 预算纪律：最多 2 条信号
+}
+
+// ── ③ thought notes（阶段 2 思考链，2026-08-13）──────────────────────────
+// 纯函数 + 文件读，零依赖、fail-open；热路径不加 embed 网络调用（关键词法）。
+
+function bigramSet(text) {
+  const t = String(text || "").replace(/\s+/g, "");
+  const s = new Set();
+  for (let i = 0; i < t.length - 1; i += 1) s.add(t.slice(i, i + 2));
+  return s;
+}
+
+/** 激活度 = 对称双向 Jaccard：|q∩th| / |q∪th|（0..1）。
+ * P1-2（审计 2026-08-14）：旧公式 coverage=hit/th.size 对 query 长度系统性
+ * 有偏——短 query 的高频字对（什么/是的/的了）可伪达 0.05 阈值注入无关
+ * thought（审计反例：“中午吃什么好呢”→0.050 注入“惊讶无锚点”；而相关
+ * query 仅 0.037 不注入，方向反了）；对长 thought（200+ 字）短 query 的
+ * 覆盖率理论上限 <0.03，标定整体失效。
+ * 双向 Jaccard 的 union 项天然包含 query 长度：粒子级伪相关（1-2 个共享
+ * bigram）至多 ~0.025 达不到阈值；真主题重叠（≥5 个共享 bigram ≈ 6 字
+ * 真实共现）才可能触发——结构性消除“短 query 伪相关”，无需长度地板常数。
+ * 比对对象 = 注入形态（≤THOUGHT_MAX_CHARS 规范化截断），与
+ * buildThoughtLayer 实际注入的文本一致（长 thought 不再因全文稀释失分）。
+ */
+export function thoughtActivation(query, thought, maxChars = THOUGHT_ACTIVATION_CHARS) {
+  const q = bigramSet(query);
+  const t = String((thought && thought.text) || "").trim().replace(/\s+/g, " ");
+  const th = bigramSet(t.slice(0, maxChars));
+  if (q.size === 0 || th.size === 0) return 0;
+  let hit = 0;
+  for (const g of th) if (q.has(g)) hit += 1;
+  const union = q.size + th.size - hit;
+  if (union <= 0) return 0;
+  return hit / union;
+}
+
+/** 读 thoughts.jsonl 最近 maxItems 条（新→旧）。缺失/损坏 → []（fail-open）。 */
+export function loadRecentThoughts(maxItems = THOUGHTS_MAX_ITEMS) {
+  try {
+    const content = readFileSync(THOUGHTS_FILE, "utf-8");
+    const lines = content.split("\n").filter(Boolean).slice(-maxItems);
+    const out = [];
+    for (const ln of lines) {
+      try {
+        const d = JSON.parse(ln);
+        if (d && typeof d.text === "string" && d.text.trim()) out.push(d);
+      } catch {
+        /* 单行损坏跳过（fail-open） */
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 按激活度取 1 条 thought（设计 §三-3；P1-4 预算重分配后 1 条/轮）。规则：
+ *   - act = 双向 Jaccard（P1-2，见 thoughtActivation）；echo.flagged → ×0.5
+ *     （防回声降权）；unresolved → +0.02（悬案连续性小幅加成——旧 0.05 是
+ *     coverage 尺度标定，Jaccard 尺度下会把 0.02 的弱相关直接推过阈值，
+ *     重演伪相关，故随尺度下调）
+ *   - act < cfg.thoughtActivationMin → 不注入（激活度低则不注入）
+ *   - P1-2：同文本 thought 精确去重（审计：两条相同文本 thought 同时
+ *     0.069/0.069 入选，thought 行 217 字里约一半是重复内容）
+ * 返回 [{thought, act}]（按 act 降序）。
+ */
+export function pickThoughts(query, thoughts, cfg) {
+  if (!Array.isArray(thoughts) || thoughts.length === 0) return [];
+  const min = Number.isFinite(cfg.thoughtActivationMin)
+    ? cfg.thoughtActivationMin
+    : 0.05;
+  const scored = [];
+  const seenTexts = new Set();
+  for (const t of thoughts.slice(-THOUGHTS_MAX_ITEMS)) {
+    const norm = String(t.text || "").trim().replace(/\s+/g, " ");
+    if (!norm || seenTexts.has(norm)) continue;
+    seenTexts.add(norm);
+    let act = thoughtActivation(query, t);
+    if (t.echo && t.echo.flagged) act *= 0.5;
+    if (t.unresolved) act += 0.02;
+    scored.push({ thought: t, act });
+  }
+  scored.sort((a, b) => b.act - a.act);
+  return scored
+    .filter((s) => s.act >= min)
+    .slice(0, Math.max(THOUGHT_INJECT_MIN, THOUGHT_INJECT_MAX));
+}
+
+/** 组装 thought 注入行（≤THOUGHT_MAX_CHARS/条，1-2 条；无命中 → null）。 */
+export function buildThoughtLayer(query, thoughts, cfg) {
+  const picked = pickThoughts(query, thoughts, cfg);
+  if (picked.length === 0) return null;
+  const bits = picked.map(({ thought }) => {
+    let text = String(thought.text || "").trim().replace(/\s+/g, " ");
+    if (text.length > THOUGHT_MAX_CHARS) text = `${text.slice(0, THOUGHT_MAX_CHARS)}…`;
+    const topic = thought.topic ? `【${thought.topic}】` : "";
+    return `${topic}${text}`;
+  });
+  return `thought:${bits.join("｜")}`;
+}
+
+/** 行动层（阶段 4，设计 v1.0 §三-6）：把**激活的 thought** 携带的行动意向
+ * （dandan 四问：该做什么/愿意做什么/想做什么/值不值得对抗体力限制 + 分级）
+ * 格式化为注入行（≤120 字）。无 action 字段/无 what → null（调用方回退占位）。
+ * ★ 边界：只展示意向，不产生任何执行动作（思考链只产出不行动）。
+ */
+export function buildActionLayer(thought) {
+  const a = thought && typeof thought === "object" ? thought.action : null;
+  if (!a || typeof a !== "object") return null;
+  const what = String(a.what || "").trim().replace(/\s+/g, " ");
+  if (!what) return null;
+  const bits = [`该做:${what}`];
+  if (typeof a.want === "string" && a.want.trim()) {
+    bits.push(`想:${a.want.trim().replace(/\s+/g, " ")}`);
+  }
+  if (typeof a.willing === "string" && a.willing.trim()) {
+    bits.push(`愿:${a.willing.trim().replace(/\s+/g, " ")}`);
+  }
+  if (typeof a.worth_against_energy === "boolean") {
+    bits.push(a.worth_against_energy ? "值得对抗体力" : "不值得对抗体力");
+  } else if (typeof a.worth_against_energy === "string" && a.worth_against_energy.trim()) {
+    bits.push(`体力权衡:${a.worth_against_energy.trim().replace(/\s+/g, " ")}`);
+  }
+  const status = a.status === "executable" ? "可执行意向" : "暂缓意向";
+  let out = `[行动] ${status}：${bits.join("；")}`;
+  // 预算纪律：≤120 字（截断标记“…”预留 1 字，实际内容 ≤119）
+  if (out.length > 120) out = `${out.slice(0, 119)}…`;
+  return out;
 }
 
 /**
@@ -439,7 +649,7 @@ function buildDoubtLayer(results, reactData) {
  * @param {object|null} reactData 体验层 A：/react 响应（可选）。在场时把
  *   记忆状态解读段扩权为景观叙事（设计 v1.1 §3.4：解读段放截断保活区，永不先截）。
  */
-export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null) {
+export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null, query = "", cfg = null, pickedThoughts = null) {
   // data 为 null = 未启用/请求失败（原因已在 postJson 记 MISS），此处不重复记
   if (!data || typeof data !== "object") return null;
   const parts = [];
@@ -468,7 +678,25 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null)
   const landscape = buildLandscapeNarrative(reactData, data);
   if (landscape) parts.push(landscape);
 
-  // 4. 最近（沙漏最新记忆）：去重 + 最多 2 条
+  // ③ thought notes（阶段 2 思考链，2026-08-13）：按"与当前对话的激活度"
+  //    取 1-2 条（bigram 覆盖度；echo 降权、悬案加成）；未激活不注入。
+  //    cfg.thoughtEnabled=false 可整体关闭（灰度回滚开关）。
+  //    阶段 4：pickedThoughts 可选——buildMemoryContext 已算好激活结果时
+  //    直接复用（避免重复读 thoughts.jsonl + 重复打分），缺省回退自行挑选
+  //    （向后兼容旧调用方/测试）。
+  const cfgT = cfg && typeof cfg === "object" ? cfg : {};
+  if (cfgT.thoughtEnabled !== false && typeof query === "string" && query) {
+    const thoughtLine = buildThoughtLayer(
+      query,
+      Array.isArray(pickedThoughts)
+        ? pickedThoughts.map((p) => p.thought)
+        : loadRecentThoughts(),
+      cfgT,
+    );
+    if (thoughtLine) parts.push(thoughtLine);
+  }
+
+  // 4. 最近（沙漏最新记忆）：去重 + 最多 2 条（放 thought 之后=截断时先丢）
   const recents = Array.isArray(data.recent)
     ? data.recent.filter((r) => r && typeof r.text === "string" && r.text.trim())
     : [];
@@ -487,9 +715,6 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null)
     logMiss("soul-empty-fields"); // P0-1：有响应但无可用字段
     return null;
   }
-  // ③ thought notes 占位（阶段 2 思考链；本阶段仅预留结构字段，不产出内容）
-  //    仅在回魂段有真实内容时追加——保持空数据 → null 的 fail-open 语义。
-  parts.push("thought:无（阶段2占位）");
   let out = `[回魂] ${parts.join(" / ")}`;
   if (out.length > maxChars) out = `${out.slice(0, maxChars)}…`;
   return out;
@@ -505,8 +730,11 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null)
  * @param {boolean} skipSelfRef 已注入【回魂】段时跳过 [记忆系统自述]（防重复）。
  * @param {object|null} reactData 体验层 A：/react 响应（可选）——质疑层的
  *   全局 precision 信号来源；缺席时质疑层仅用条目自身信号（向后兼容）。
+ * @param {object|null} activatedThought 阶段 4：当前对话激活的 thought（可选，
+ *   默认 null）。它的 action 字段（行动意向四问）经 buildActionLayer 注入⑥行动层；
+ *   无激活 thought / 无 action → 回退占位。仅展示意向，零执行动作。
  */
-export function buildContextText(data, query, maxChars, skipSelfRef = false, reactData = null) {
+export function buildContextText(data, query, maxChars, skipSelfRef = false, reactData = null, activatedThought = null) {
   if (!data || typeof data !== "object") {
     logMiss("recall-invalid-response"); // P0-1：/recall 响应结构异常
     return null;
@@ -545,10 +773,11 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
     lines.push(`${i + 1}. ${meta} ${it.text}`);
   }
 
-  // ⑤ 质疑层 + ⑥ 行动层占位（阶段 4 实现）
+  // ⑤ 质疑层 + ⑥ 行动层（阶段 4：激活的 thought 才带行动意向；无则占位）
   const doubt = buildDoubtLayer(results, reactData);
   if (doubt) lines.push(doubt);
-  lines.push("[行动] 无（阶段4占位）");
+  const actionLine = buildActionLayer(activatedThought);
+  lines.push(actionLine || "[行动] 无（暂无行动意向）");
 
   // 反思回流：附加记忆系统最近自述（LMS self_ref 产物）；
   // 回魂段已含自述时跳过，避免重复占用上下文预算。
@@ -682,15 +911,32 @@ export async function buildMemoryContext(prompt, pluginConfig) {
       recallFromGlue(query, cfg),
     ]);
 
-    // 【回魂】段（≤soulMaxChars），优先于记忆块；解读段经 reactData 追加
-    const soulText = buildSoulText(soulData, cfg.soulMaxChars, reactData);
-    // 记忆块预算 = 总量 - 回魂段 - "\n\n" 分隔符（与 composeContext 的
+    // 阶段 4：激活 thought 一次挑选、两处复用（③ thought 层 + ⑥ 行动层）——
+    // 避免重复读 thoughts.jsonl 与重复打分；激活的 thought 才带行动意向
+    // （设计 §三-6：未激活不注入）。thoughtEnabled=false 时零文件读（整体关闭）。
+    let pickedThought = null;
+    let picked = [];
+    if (cfg.thoughtEnabled !== false) {
+      const thoughts = loadRecentThoughts();
+      picked = pickThoughts(query, thoughts, cfg);
+      pickedThought = picked.length > 0 ? picked[0].thought : null;
+    }
+    // 【回魂】段（≤soulMaxChars），优先于记忆块；解读段经 reactData 追加；
+    // 阶段 2：query + cfg 透传（③ thought notes 激活度筛选需要）
+    const soulText = buildSoulText(soulData, cfg.soulMaxChars, reactData, query, cfg, picked);
+    // P1-4（审计 2026-08-14）：注入预算余量保护。旧实现按 maxChars 顶格执行
+    // （实测 798/800，余量 2 字——回魂段 301 必截、最近记忆必丢）。现在：
+    //   ① 总量按 maxChars-COMPOSE_MARGIN=760 执行（40 字安全余量）；
+    //   ② thought ≤60 字/条 + 去重 + 单条上限（回魂段内「最近」不再被挤掉）；
+    //   ③ 回魂段保护优先级不变：[回魂] 永不先截（composeContext 先截记忆块）。
+    const injectBudget = Math.max(200, cfg.maxChars - COMPOSE_MARGIN);
+    // 记忆块预算 = 注入预算 - 回魂段 - "\n\n" 分隔符（与 composeContext 的
     // keep=soulText.length+2 对齐，避免 compose 二次截断吃掉尾部结构层）
-    const memoryBudget = Math.max(200, cfg.maxChars - (soulText ? soulText.length + 2 : 0));
+    const memoryBudget = Math.max(200, injectBudget - (soulText ? soulText.length + 2 : 0));
     // reactData 透传给 buildContextText：质疑层需要全局 precision 信号
-    const memoryText = buildContextText(recallData, query, memoryBudget, Boolean(soulText), reactData);
+    const memoryText = buildContextText(recallData, query, memoryBudget, Boolean(soulText), reactData, pickedThought);
 
-    return composeContext(soulText, memoryText, cfg.maxChars);
+    return composeContext(soulText, memoryText, injectBudget);
   } catch (err) {
     logMiss(`unexpected ${err instanceof Error ? err.message : String(err)}`); // P0-1：兜底
     return null;

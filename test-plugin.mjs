@@ -24,6 +24,8 @@ const {
   buildContextText,
   buildSoulText,
   composeContext,
+  parseConfidenceTag,
+  buildDoubtLayer,
   _resetRateLimitForTest,
   _getRateLimitStateForTest,
 } = await import("./memory-recall.js");
@@ -358,6 +360,82 @@ async function recallFromGlueForTest() {
   if (!resp.ok) throw new Error(`glue /recall HTTP ${resp.status}`);
   return resp.json();
 }
+
+console.log("== 2.4 质疑层（阶段 3：真实 precision 数据源）==");
+
+ok("质疑层: 解析 ⚠️置信 标注（真实条目置信度）", () => {
+  assert.equal(parseConfidenceTag("文本 ⚠️置信0.3驳2 尾巴"), 0.3);
+  assert.equal(parseConfidenceTag("无标注文本"), null);
+});
+
+ok("质疑层: 全局怀疑水位 + 分位怀疑线判定（零固定阈值）", () => {
+  const results = [
+    { origin: "memory", text: "条目A ⚠️置信0.2驳1" },
+    { origin: "archive", text: "条目B" },
+  ];
+  const reactData = {
+    reaction: {
+      doubt: {
+        baseline: 0.72,        // 波动↑ → 全局怀疑水位偏高
+        threshold: 0.35,       // conformal 分位线（P85）
+        threshold_quantile: 0.85,
+        cold: false,
+      },
+    },
+  };
+  const out = buildDoubtLayer(results, reactData);
+  assert.ok(out && out.startsWith("[质疑] "));
+  assert.ok(out.includes("全局怀疑水位偏高"));      // 动态基线，非固定阈值
+  assert.ok(out.includes("低于动态怀疑线P85"));     // 条目0.2 < 线0.35 → 该被怀疑
+  // 预算纪律：水位+分位已 2 条，归档信号被预算截断（见预算测试）
+});
+
+ok("质疑层: 来源维度（归档条目）独立报告", () => {
+  const out = buildDoubtLayer(
+    [{ origin: "archive", text: "旧条目" }],
+    { reaction: {} });
+  assert.ok(out && out.includes("归档条目"));
+});
+
+ok("质疑层: 置信度高于动态线 → 不标该条（只报水位）", () => {
+  const results = [{ origin: "memory", text: "条目A ⚠️置信0.8" }];
+  const reactData = {
+    reaction: { doubt: { baseline: 0.55, threshold: 0.35, cold: false } },
+  };
+  const out = buildDoubtLayer(results, reactData);
+  assert.ok(out && out.startsWith("[质疑] "));
+  assert.ok(!out.includes("低于动态怀疑线"));
+});
+
+ok("质疑层: 无 precision 信号（开关关/冷启动）→ 回退旧启发式", () => {
+  // doubt 块缺失（开关关）→ 旧行为：协同分接近启发式
+  const spread = [
+    { origin: "memory", text: "A", scores: { total: 0.5 } },
+    { origin: "memory", text: "B", scores: { total: 0.51 } },
+  ];
+  const out1 = buildDoubtLayer(spread, { reaction: {} });
+  assert.ok(out1 && out1.includes("伪相关风险"));
+  // 冷启动（doubt.cold=true）→ 显式声明不可考
+  const out2 = buildDoubtLayer([], {
+    reaction: { doubt: { baseline: 0.5, threshold: 0.3, cold: true } },
+  });
+  assert.ok(out2 && out2.includes("置信度不可考"));
+});
+
+ok("质疑层: 预算纪律（最多 2 条信号）", () => {
+  const results = [
+    { origin: "memory", text: "A ⚠️置信0.1驳3" },
+    { origin: "memory", text: "B ⚠️置信0.2驳2" },
+    { origin: "archive", text: "C" },
+  ];
+  const reactData = {
+    reaction: { doubt: { baseline: 0.9, threshold: 0.5, cold: false } },
+  };
+  const out = buildDoubtLayer(results, reactData);
+  assert.ok(out);
+  const signalCount = (out.match(/；/g) || []).length + 1;
+  assert.ok(signalCount <= 2);
+});
 
 console.log("== 2.5 store-turn 写侧（agent_end，阶段2 S2-1）==");
 

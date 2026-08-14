@@ -29,7 +29,7 @@
 //   6. 防污染四闸：心跳/子代理/cron/模板 + INTERSESSION-EXTRACT 成果提取（M-4）。
 
 import { createHash } from "node:crypto";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { stripInboundMetadata } from "./memory-recall.js";
 
 const GLUE_DEFAULT_URL = "http://127.0.0.1:19000";
@@ -43,6 +43,9 @@ const USER_MAX_CHARS = 2000;
 const OUTPUT_MAX_CHARS = 20000;
 const SENDER = "openclaw-agent_end";
 const STORE_LOG_FILE = "/tmp/glue-store-debug.log";
+// C-18 断流告警状态文件（2026-08-13 事故 P0 补洞）：每轮 agent_end（含所有 SKIP 分支）
+// 原子更新，供契约 C-18 判定"有对话但写侧断流"。原子写=临时文件+rename，异常 fail-open。
+const STORE_STATE_FILE = "/tmp/glue-store-state.json";
 // 开关 env fallback（2026-08-12 最终定案：config.storeTurn.enabled 优先，env 仅兜底，见文件头）。
 // 值必须精确为 "true"。
 const STORE_TURN_ENABLED_ENV = "GLUE_STORE_TURN_ENABLED";
@@ -71,6 +74,35 @@ function logStore(kind, detail) {
     appendFileSync(STORE_LOG_FILE, `[${new Date().toISOString()}] ${kind} ${detail}\n`);
   } catch {
     /* 日志失败忽略：不引入新崩溃点 */
+  }
+}
+
+/**
+ * C-18 状态文件原子更新（读-改-写 + 临时文件 rename）。
+ * 每次 handleAgentEnd 进入都会刷新 last_agent_end_at；SKIP 分支写 last_skip_reason；
+ * STORE-OK 写 last_store_ok_at 并清 last_skip_reason。任何异常吞掉 fail-open，不影响主流程。
+ * @param {object} [opts]
+ * @param {string} [opts.agentEndAt] ISO——本轮 agent_end 进入时刻
+ * @param {string} [opts.storeOkAt] ISO——仅 STORE-OK 时传
+ * @param {string|null} [opts.skipReason]——SKIP 分支原因；null 表示清空（成功轮）
+ */
+function updateStoreState({ agentEndAt = null, storeOkAt = null, skipReason = undefined } = {}) {
+  try {
+    let state = {};
+    try {
+      state = JSON.parse(readFileSync(STORE_STATE_FILE, "utf8"));
+    } catch {
+      state = {}; // 首次写入/损坏 → 从零开始
+    }
+    if (agentEndAt) state.last_agent_end_at = agentEndAt;
+    if (storeOkAt) state.last_store_ok_at = storeOkAt;
+    if (skipReason !== undefined) state.last_skip_reason = skipReason;
+    state.updated_at = new Date().toISOString();
+    const tmp = `${STORE_STATE_FILE}.tmp`;
+    writeFileSync(tmp, JSON.stringify(state), "utf8");
+    renameSync(tmp, STORE_STATE_FILE);
+  } catch {
+    /* fail-open：状态文件写失败不影响写侧主流程 */
   }
 }
 
@@ -289,6 +321,8 @@ function fingerprintSet(key) {
  */
 export async function handleAgentEnd(event, ctx, api, env = process.env) {
   try {
+    // C-18 状态文件：每轮 agent_end 进入即刷新 last_agent_end_at（含后续所有 SKIP 分支）
+    updateStoreState({ agentEndAt: new Date().toISOString(), skipReason: null });
     const cfg = resolveStoreConfig(
       event?.context?.pluginConfig ?? api?.pluginConfig,
       env,
@@ -297,34 +331,58 @@ export async function handleAgentEnd(event, ctx, api, env = process.env) {
       typeof ctx?.runId === "string" && ctx.runId ? ctx.runId : "no-runid";
     if (!cfg.enabled) {
       logStore("STORE-SKIP", `reason=plugin-disabled run=${runId}`);
+      updateStoreState({ skipReason: "plugin-disabled" });
       return;
     }
 
     // 会话白名单（只写 main 脑）
-    const sid = typeof ctx?.sessionId === "string" && ctx.sessionId ? ctx.sessionId : "main";
+    // 2026-08-13 修复：固定写 main 会话（与读侧 /recall 一致）。
+    // 根因：OpenClaw 会话重置后 ctx.sessionId 变为 UUID（b9782e3b…），不在
+    // sessionIds 白名单 → 写侧断流 10 小时（8/13 实测全 STORE-SKIP reason=session）。
+    // 设计意图本就是"只写 main 脑白名单会话"（见文件头注释），ctx.sessionId
+    // 易变不可依赖；写侧固定 main，与读侧/白名单天然一致。
+    const sid = "main";
     if (!cfg.sessionIds.includes(sid)) {
       logStore("STORE-SKIP", `reason=session sid=${sid} run=${runId}`);
+      updateStoreState({ skipReason: "session" });
       return;
     }
 
     // 防污染四闸：①心跳（run 级信号）
     if (ctx?.trigger === "heartbeat") {
       logStore("STORE-SKIP", `reason=heartbeat run=${runId}`);
+      updateStoreState({ skipReason: "heartbeat" });
       return;
     }
     // ②子代理（SUBAGENT-SKIP 先例，sessionKey 含 subagent 段）
     if (typeof ctx?.sessionKey === "string" && /(^|:)subagent[:.]/i.test(ctx.sessionKey)) {
       logStore("STORE-SKIP", `reason=subagent sessionKey=${String(ctx.sessionKey)} run=${runId}`);
+      updateStoreState({ skipReason: "subagent" });
+      return;
+    }
+    // ⑦非主 agent 不写（C-18 匹配层，2026-08-13）：sessionKey 不是 agent:main:* 前缀
+    // → 非主会话（多用户/其他 agent 上下文）一律不写，防污染 main 脑。
+    // 实测格式：主会话=agent:main:轻如烟，子代理=agent:main:subagent:*（均以 agent:main: 开头，
+    // 不误拦）；子代理由 ② 闸先拦。sessionKey 缺省 → fail-open 不拦（沿用 ② 的缺省策略）。
+    if (
+      typeof ctx?.sessionKey === "string" &&
+      ctx.sessionKey &&
+      !/^agent:main:/.test(ctx.sessionKey)
+    ) {
+      logStore("STORE-SKIP", `reason=not-main-agent sessionKey=${String(ctx.sessionKey)} run=${runId}`);
+      updateStoreState({ skipReason: "not-main-agent" });
       return;
     }
     // ⑥cron/注入
     if (ctx?.jobId || ctx?.trigger === "cron") {
       logStore("STORE-SKIP", `reason=cron run=${runId}`);
+      updateStoreState({ skipReason: "cron" });
       return;
     }
     // ④失败/中止轮
     if (event?.success === false) {
       logStore("STORE-SKIP", "reason=failed-turn");
+      updateStoreState({ skipReason: "failed-turn" });
       return;
     }
 
@@ -332,6 +390,7 @@ export async function handleAgentEnd(event, ctx, api, env = process.env) {
     const turn = extractTurnFromMessages(event?.messages, ctx);
     if (turn.skip) {
       logStore("STORE-SKIP", `reason=${turn.skip} run=${runId}`);
+      updateStoreState({ skipReason: turn.skip });
       return;
     }
 
@@ -339,6 +398,7 @@ export async function handleAgentEnd(event, ctx, api, env = process.env) {
     const fpKey = `${runId}\x00${turn.turnKey}`;
     if (fingerprintHas(fpKey)) {
       logStore("STORE-DEDUP", `plugin-fingerprint run=${runId}`);
+      updateStoreState({ skipReason: "dedup" });
       return;
     }
 
@@ -346,6 +406,7 @@ export async function handleAgentEnd(event, ctx, api, env = process.env) {
     const now = Date.now();
     if (now - lastStoreOkAt < cfg.minIntervalMs) {
       logStore("STORE-SKIP", `reason=rate-limit elapsed=${now - lastStoreOkAt}ms run=${runId}`);
+      updateStoreState({ skipReason: "rate-limit" });
       return;
     }
 
@@ -355,6 +416,8 @@ export async function handleAgentEnd(event, ctx, api, env = process.env) {
       // 指纹只在 2xx 后记录（失败不记 → 同 run 后续 fire 可重试，L2 幂等兜底防双写）
       fingerprintSet(fpKey);
       lastStoreOkAt = Date.now();
+      // C-18：仅 STORE-OK 更新 last_store_ok_at 并清 skip 原因
+      updateStoreState({ storeOkAt: new Date().toISOString(), skipReason: null });
       const d = result.data || {};
       if (d.stored === true) seq += 1;
       // M-1 判据 3 数据源：stored/dedup_hit 由 /store 响应透传（只有真写入才 stored=true）；
