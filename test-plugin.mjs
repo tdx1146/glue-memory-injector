@@ -26,6 +26,8 @@ const {
   composeContext,
   parseConfidenceTag,
   buildDoubtLayer,
+  modulationTier,
+  buildModulationConstraint,
   _resetRateLimitForTest,
   _getRateLimitStateForTest,
 } = await import("./memory-recall.js");
@@ -435,6 +437,99 @@ ok("质疑层: 预算纪律（最多 2 条信号）", () => {
   assert.ok(out);
   const signalCount = (out.match(/；/g) || []).length + 1;
   assert.ok(signalCount <= 2);
+});
+
+console.log("== 2.45 L1 生成约束（状态调制生成·第一跳，2026-08-14）==");
+
+ok("L1: S2 控制变量——仅 baseline 变 → 约束段变（0.3 无约束 vs 0.7 强约束）", () => {
+  const low = buildModulationConstraint({ baseline: 0.3, cold: false, enabled: true });
+  const high = buildModulationConstraint({ baseline: 0.7, cold: false, enabled: true });
+  assert.equal(low, null, "baseline<0.4 → 无约束");
+  assert.ok(high && high.startsWith("[生成约束] "), "baseline≥0.6 → 强约束");
+  assert.ok(high.includes("生成要求："), "命令式句法护栏：以'生成要求：'开头（修订 4/P1-3）");
+  assert.ok(high.includes("校准水位0.70"), "水位仅作校准参数且含具体值（连续变化）");
+  assert.ok(high.includes("①区分事实与推断") && high.includes("④关键结论给出替代候选"), "强约束四规则");
+  // 句法护栏：禁止描述式混入（"当前怀疑水位较高"这类独立描述句不得入约束段）
+  assert.ok(!/当前(处于|怀疑|环境)/.test(high), "无描述式状态句混入约束段");
+  assert.ok(low !== high, "0.3 与 0.7 约束文本不同（控制变量）");
+});
+
+ok("L1: 映射边界——0.4 轻 / 0.6 强（固定带边界）", () => {
+  const light = buildModulationConstraint({ baseline: 0.4, cold: false, enabled: true });
+  const strong = buildModulationConstraint({ baseline: 0.6, cold: false, enabled: true });
+  assert.ok(light.includes("校准水位0.40") && light.includes("①输出需校准"), "0.4 落在轻约束带");
+  assert.ok(strong.includes("①区分事实与推断"), "0.6 落在强约束带");
+});
+
+ok("L1: 连续校准——同一档内仅水位变 → 约束文本变（0.42 vs 0.58）", () => {
+  const a = buildModulationConstraint({ baseline: 0.42, cold: false, enabled: true });
+  const b = buildModulationConstraint({ baseline: 0.58, cold: false, enabled: true });
+  assert.ok(a && b && a !== b, "水位参数化 → 同档内连续变化");
+  assert.ok(a.includes("校准水位0.42") && b.includes("校准水位0.58"));
+});
+
+ok("L1: 冷启动保护（修订 5/坑 1）——cold=true 或 enabled=false 不触发约束", () => {
+  // 冷启动期 doubt_baseline()=0.5 中性值会落在轻约束带 [0.4,0.6)——必须不触发
+  assert.equal(buildModulationConstraint({ baseline: 0.5, cold: true, enabled: true }), null, "cold=true → 无约束");
+  assert.equal(buildModulationConstraint({ enabled: false }), null, "enabled=false → 无约束");
+  // 无 precision 信号（接口失败/块缺失）→ fail-open 不约束
+  assert.equal(buildModulationConstraint(null), null);
+  assert.equal(buildModulationConstraint({}), null);
+  const t = modulationTier({ baseline: 0.5, cold: true, enabled: true });
+  assert.equal(t.reason, "cold", "S3 日志维度：原因可区分");
+});
+
+ok("L1: 字段修正（修订 6/坑 2）——读 baseline 键，与 gap 热度 doubt 字段区分", () => {
+  // 语义陷阱：status.doubt 是 gap 热度（fok_unresolved+low_confidence），非 precision baseline；
+  // 本函数只认 doubt.baseline 数值键，非数字/缺失 → 不触发
+  assert.equal(buildModulationConstraint({ gap: 0.9, heat: 1.0 }), null, "无 baseline 键 → 不触发");
+  assert.equal(buildModulationConstraint({ baseline: "0.7" }), null, "baseline 非数值 → 不触发（fail-open）");
+  assert.ok(buildModulationConstraint({ baseline: 0.71, cold: false, enabled: true }).includes("校准水位0.71"));
+});
+
+ok("L1: 注入块集成——约束段 unshift 到最前、与质疑层语义分离", () => {
+  const data = {
+    results: [
+      { origin: "memory", text: "条目A ⚠️置信0.8", scores: { total: 0.9 } },
+      { origin: "memory", text: "条目B ⚠️置信0.7", scores: { total: 0.8 } },
+    ],
+  };
+  // 高怀疑：约束段在最前 + 质疑层并存（质疑=描述状态，约束=命令式规则，两段分离）
+  const reactHigh = { reaction: { doubt: { baseline: 0.72, cold: false, enabled: true } } };
+  const outHigh = buildContextText(data, "测试", 800, true, reactHigh, null);
+  assert.ok(outHigh.startsWith("[生成约束] "), "约束段在注入块最前（保活位置，修订 3）");
+  assert.ok(outHigh.includes("[质疑] "), "质疑层仍在（描述'在怀疑什么'）");
+  const constraintIdx = outHigh.indexOf("[生成约束]");
+  const doubtIdx = outHigh.indexOf("[质疑]");
+  assert.ok(constraintIdx !== -1 && doubtIdx !== -1 && constraintIdx < doubtIdx, "约束段在质疑层之前（语义分离：规则段显眼处）");
+  assert.ok(!outHigh.includes("当前怀疑水位偏高"), "约束段无描述式状态句（描述句只属于质疑层）");
+  // 低怀疑：无约束段，但质疑层照常（描述状态不因水位低而消失）
+  const reactLow = { reaction: { doubt: { baseline: 0.3, cold: false, enabled: true } } };
+  const outLow = buildContextText(data, "测试", 800, true, reactLow, null);
+  assert.ok(!outLow.includes("[生成约束]"), "baseline<0.4 → 无约束段");
+  assert.ok(outLow.startsWith("[记忆注入] "), "无约束时正常形态");
+});
+
+ok("L1: 截断保活（修订 3/P1-2）——约束段不被截断链吃掉", () => {
+  const data = {
+    results: [
+      { origin: "memory", text: "长条目" + "内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容".repeat(8), scores: { total: 0.9 } },
+      { origin: "memory", text: "长条目" + "更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多".repeat(8), scores: { total: 0.8 } },
+      { origin: "memory", text: "长条目" + "内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容".repeat(8), scores: { total: 0.7 } },
+      { origin: "memory", text: "长条目" + "更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多更多".repeat(8), scores: { total: 0.6 } },
+      { origin: "memory", text: "长条目" + "内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容内容".repeat(8), scores: { total: 0.5 } },
+    ],
+  };
+  const react = { reaction: { doubt: { baseline: 0.75, cold: false, enabled: true } } };
+  // 小预算强制触发 buildContextText 截断（条目压缩 + 极端兜底都可能发生）
+  const out = buildContextText(data, "测试", 300, true, react, null);
+  assert.ok(out.length <= 300, `截断后 ≤maxChars（实际 ${out.length}）`);
+  assert.ok(out.startsWith("[生成约束] "), "极端兜底整体截断从头保留 → 约束段仍在头部");
+  // composeContext 保活：回魂段永不先截、约束段第二优先级（记忆块被截时约束段仍在）
+  const soul = "[回魂] 自述:测试 / 状态:熵0.95 惊讶0.11 目的0.92 / 最近:记忆x";
+  const composed = composeContext(soul, out, 200);
+  assert.ok(composed.includes("[回魂]"), "回魂段保留（第一优先级）");
+  assert.ok(composed.includes("[生成约束]"), "约束段保留（第二优先级，先截记忆块尾部）");
 });
 
 console.log("== 2.5 store-turn 写侧（agent_end，阶段2 S2-1）==");

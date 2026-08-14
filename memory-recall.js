@@ -288,6 +288,8 @@ export function _resetRateLimitForTest() {
 // 阶段 3（precision 三层动态化）：质疑层数据源函数导出（供 test-plugin.mjs
 // 直接单测——纯函数，零副作用；导出不改变任何行为）。阶段 4：行动层
 // buildActionLayer 已随函数声明导出（见下，不在此重复导出）。
+// L1 生成约束（2026-08-14，状态调制生成·第一跳）：buildModulationConstraint /
+// modulationTier 导出供单测（纯函数，见下实现）。
 export { parseConfidenceTag, buildDoubtLayer };
 
 // 仅供测试：读取限流状态
@@ -509,6 +511,86 @@ function buildDoubtLayer(results, reactData) {
 
   if (doubts.length === 0) return null;
   return `[质疑] ${doubts.slice(0, 2).join("；")}`; // 预算纪律：最多 2 条信号
+}
+
+// ── L1 生成约束（状态调制生成 · 第一跳，2026-08-14，设计 v1.1 §二 + §八 修订 1-7）──
+// 灵魂：怀疑水位高 → 生成更谨慎（可观测），不是"状态可见"。约束段是**命令式规则**
+// （"生成要求：①②③④"），与质疑层（描述"在怀疑什么"）语义分离——质疑层=状态描述，
+// 约束段=生成规则（修订 4/P1-3 命令式句法护栏：禁止描述式混入约束段）。
+//
+// 信号源（修订 2/6）：直接消费已到手的 reactData.reaction.doubt（LMS /react → glue
+// 薄代理 → 插件，链路已存在，零新 HTTP）；读 snapshot 键 `baseline`（precision_adapt
+// 快照字段，不是 status.doubt——那是 gap 热度，语义不同）。
+//
+// 映射（设计 §二）：
+//   doubt_baseline < 0.4          → 无约束（正常生成）
+//   0.4 ≤ baseline < 0.6          → 轻约束（校准水位参数化）
+//   doubt_baseline ≥ 0.6          → 强约束（四规则 + 具体水位值）
+// 冷启动/开关关（修订 5/坑 1）：cold=true 或 enabled=false → 不触发任何约束
+// （防 doubt_baseline=0.5 中性值在冷启动期误触发轻约束）。
+//
+// 保活（修订 3/P1-2）：约束段 unshift 到注入块最前（见 buildContextText）——
+// 截断链（buildContextText 压缩条目尾部 / composeContext 先截记忆块）从尾到头，
+// 约束段在头部永不触及；保活优先级：回魂段 > 约束段 > 其余。
+
+/** L1 调制决策（纯函数）：doubt 快照 → {action, reason, baseline}。
+ * action: "none" | "light" | "strong"；reason 区分不触发的四种原因（S3 日志维度）。
+ */
+export function modulationTier(doubt) {
+  const d = doubt && typeof doubt === "object" ? doubt : {};
+  // 修订 5（坑 1）：冷启动 / 开关关保护——不触发任何约束
+  if (d.cold === true) return { action: "none", reason: "cold" };
+  if (d.enabled === false) return { action: "none", reason: "disabled" };
+  // 修订 6（坑 2）：读 snapshot 键 baseline（0-1 连续量）；缺信号 → fail-open 不约束
+  const baseline =
+    typeof d.baseline === "number" && Number.isFinite(d.baseline) ? d.baseline : null;
+  if (baseline === null) return { action: "none", reason: "no-signal", baseline };
+  if (baseline >= 0.6) return { action: "strong", reason: "in-band", baseline };
+  if (baseline >= 0.4) return { action: "light", reason: "in-band", baseline };
+  return { action: "none", reason: "below-band", baseline };
+}
+
+/** L1 生成约束文本（纯函数）：baseline → 命令式约束文本，或 null（不触发）。
+ * 句法护栏（修订 4/P1-3）：唯一形态 = "[生成约束] 生成要求：<祈使规则>（校准水位X）"；
+ * 水位仅作校准参数（连续变化：0.42 → 水位0.42），禁止独立描述句。
+ */
+export function buildModulationConstraint(doubt) {
+  const tier = modulationTier(doubt);
+  if (tier.action === "none") return null;
+  const wl = tier.baseline.toFixed(2);
+  if (tier.action === "strong") {
+    return `[生成约束] 生成要求：①区分事实与推断 ②不确定处明确标注“低置信” ③避免绝对化断言（一定/绝对/毫无疑问/必然）④关键结论给出替代候选（校准水位${wl}）`;
+  }
+  return `[生成约束] 生成要求：①输出需校准，避免过度自信 ②不确定处标注“低置信”（校准水位${wl}）`;
+}
+
+// S3 链路日志（修订 7 / audit A P1-2）：JS 侧记录 baseline 值 → 调制动作 → 生效。
+// 与 logMiss 同模式（appendFileSync 到 /tmp/glue-hook-debug.log），日志失败绝不影响主流程。
+function logModulate(tier, constraint, truncated = false) {
+  try {
+    const bl =
+      tier && tier.baseline !== undefined && tier.baseline !== null
+        ? tier.baseline.toFixed(2)
+        : "n/a";
+    if (truncated) {
+      appendFileSync(
+        DEBUG_LOG_FILE,
+        `[${new Date().toISOString()}] MODULATE baseline=${bl} action=${tier ? tier.action : "?"} injected=false reason=truncated-eaten\n`,
+      );
+    } else if (constraint) {
+      appendFileSync(
+        DEBUG_LOG_FILE,
+        `[${new Date().toISOString()}] MODULATE baseline=${bl} action=${tier.action} injected=true len=${constraint.length}\n`,
+      );
+    } else {
+      appendFileSync(
+        DEBUG_LOG_FILE,
+        `[${new Date().toISOString()}] MODULATE baseline=${bl} action=none reason=${tier.reason}\n`,
+      );
+    }
+  } catch {
+    /* 日志失败忽略：不引入新崩溃点 */
+  }
 }
 
 // ── ③ thought notes（阶段 2 思考链，2026-08-13）──────────────────────────
@@ -779,6 +861,19 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
   const actionLine = buildActionLayer(activatedThought);
   lines.push(actionLine || "[行动] 无（暂无行动意向）");
 
+  // ── L1 生成约束（状态调制生成 · 第一跳）──
+  // 信号源 = reactData.reaction.doubt（与质疑层同源，零新 HTTP，修订 2/6）；
+  // 冷启动/开关关保护（修订 5）；命令式句法护栏（修订 4）。
+  // 保活（修订 3/P1-2）：约束段 unshift 到注入块**最前**（[记忆注入] 头之前）——
+  // 截断链从尾到头（buildContextText 压缩条目 / composeContext 先截记忆块），
+  // 头部永不触及；保活优先级：回魂段（永不先截）> 约束段 > 其余。lost-in-the-middle
+  // 位置纪律：约束是"该如何生成"的指令，放最显眼处。
+  // 语义分离：质疑层=描述状态（在怀疑什么）；约束段=命令式规则（该如何生成）。
+  const constraint = buildModulationConstraint(reactData?.reaction?.doubt);
+  if (constraint) lines.unshift(constraint);
+  // S3 链路日志（修订 7）：baseline 值 → 调制动作 → 生效（每轮可查）
+  logModulate(modulationTier(reactData?.reaction?.doubt), constraint);
+
   // 反思回流：附加记忆系统最近自述（LMS self_ref 产物）；
   // 回魂段已含自述时跳过，避免重复占用上下文预算。
   if (!skipSelfRef) {
@@ -816,8 +911,13 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
       }
     }
     if (joined.length > maxChars) {
-      // 极端兜底（条目全部触底仍超限）：整体截断
+      // 极端兜底（条目全部触底仍超限）：整体截断（从头保留——约束段在头部
+      // 不受影响；若极端情形仍被吃掉，记 MODULATE-TRUNCATED 事件日志，
+      // 调制静默失效必须可观测，修订 3/P1-2）。
       joined = `${joined.slice(0, maxChars)}…（截断）`;
+      if (constraint && !joined.includes("[生成约束]")) {
+        logModulate(modulationTier(reactData?.reaction?.doubt), constraint, true);
+      }
     }
   }
   return joined;
