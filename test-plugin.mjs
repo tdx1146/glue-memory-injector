@@ -23,6 +23,7 @@ const {
   buildMemoryContext,
   buildContextText,
   buildSoulText,
+  buildDiffuseProbe,
   composeContext,
   parseConfidenceTag,
   buildDoubtLayer,
@@ -229,6 +230,37 @@ await okAsync("buildSoulText：超长被截断到 maxChars", () => {
   );
   assert.ok(text.length <= 120 + 1, `应 ≤120（含截断标记），实际 ${text.length}`);
   assert.ok(text.startsWith("[回魂]"), "截断后仍以 [回魂] 开头");
+});
+
+// ── 阶段 1 弥散态专项（2026-08-16，v1.2 §四）：探测型注入判据 3.09 ──
+await okAsync("buildDiffuseProbe：弥散态报可验证读数 + [异常] 显式标记（判据 3.09）", () => {
+  const probe = buildDiffuseProbe(
+    { entropy_ratio: 0.9998, surprise: 9.96, mse: 0.9075, precision_mean: 0.3361 },
+    {},
+    0.9998,
+  );
+  assert.ok(probe && probe.includes("[异常] 弥散态"), `应含 [异常] 弥散态 显式标记，实际: ${probe}`);
+  assert.ok(probe.includes("熵0.9998"), `应含可验证读数熵0.9998，实际: ${probe}`);
+  assert.ok(probe.includes("惊讶9.96"), `应含可验证读数惊讶9.96，实际: ${probe}`);
+  assert.ok(probe.includes("mse0.908") || probe.includes("mse0.907"), `应含 mse 读数，实际: ${probe}`);
+  assert.ok(probe.includes("行为层过渡补丁，不等同于状态场修复"), `应含定位标注，实际: ${probe}`);
+  // 判据 3.09（v1.2）：报数与报异常数可区分——显式 [异常] 标签在读数行首
+  assert.ok(probe.indexOf("[异常]") < probe.indexOf("惊讶"), "显式异常标记应在读数之前");
+});
+
+await okAsync("buildDiffuseProbe：非弥散态（熵比低于阈值）→ null（恢复激活主题叙事）", () => {
+  const probe = buildDiffuseProbe(
+    { entropy_ratio: 0.7, surprise: 0.5 },
+    {},
+    0.7,
+  );
+  assert.ok(probe === null, `非弥散态不应触发探测注入，实际: ${probe}`);
+});
+
+await okAsync("buildDiffuseProbe：字段缺失 fail-open（不编数字）", () => {
+  const probe = buildDiffuseProbe({ entropy_ratio: 0.9998 }, {}, 0.9998);
+  assert.ok(probe && probe.includes("[异常]"), "仅熵比在场也应报状态+异常标记");
+  assert.ok(probe.includes("缺口"), "缺口行应存在（显式不可读，不编数字）");
 });
 
 await okAsync("回魂+记忆：注入文本 = [回魂]在前 + [记忆注入]在后，总量≤maxChars", async () => {
