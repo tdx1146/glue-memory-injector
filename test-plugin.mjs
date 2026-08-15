@@ -24,6 +24,7 @@ const {
   buildContextText,
   buildSoulText,
   buildDiffuseProbe,
+  buildLandscapeNarrative,
   composeContext,
   parseConfidenceTag,
   buildDoubtLayer,
@@ -248,13 +249,23 @@ await okAsync("buildDiffuseProbe：弥散态报可验证读数 + [异常] 显式
   assert.ok(probe.indexOf("[异常]") < probe.indexOf("惊讶"), "显式异常标记应在读数之前");
 });
 
-await okAsync("buildDiffuseProbe：非弥散态（熵比低于阈值）→ null（恢复激活主题叙事）", () => {
-  const probe = buildDiffuseProbe(
-    { entropy_ratio: 0.7, surprise: 0.5 },
+await okAsync("buildDiffuseProbe：非弥散态（熵比低于阈值）→ 注入面不输出探测段", () => {
+  // 阈值闸门在 buildLandscapeNarrative（v1.2 §四：熵比 ≥ DIFFUSE_ENTROPY_RATIO
+  // 才走探测分支）；buildDiffuseProbe 是纯构造器、不承担闸门——
+  // 非弥散态不输出探测段由注入面入口保证（判据 3.09 v1.2）。
+  const narr = buildLandscapeNarrative(
+    { reaction: { entropy_ratio: 0.7, surprise: 0.5, interpretation: "低唤醒·单模式聚焦" } },
     {},
-    0.7,
   );
-  assert.ok(probe === null, `非弥散态不应触发探测注入，实际: ${probe}`);
+  assert.ok(narr === null || !narr.includes("[异常]"),
+    `非弥散态不应输出探测段（[异常] 标记），实际: ${narr}`);
+  // 弥散态经同一注入面入口 → 输出探测段（回归验证闸门在职）
+  const probe = buildLandscapeNarrative(
+    { reaction: { entropy_ratio: 0.9998, surprise: 9.96 } },
+    {},
+  );
+  assert.ok(probe && probe.includes("[异常] 弥散态"),
+    `弥散态经注入面应输出探测段，实际: ${probe}`);
 });
 
 await okAsync("buildDiffuseProbe：字段缺失 fail-open（不编数字）", () => {
