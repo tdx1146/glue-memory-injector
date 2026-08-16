@@ -84,6 +84,31 @@ const THOUGHT_INJECT_MAX = 2;    // 灰度上限（预算余量时升 2）
 // 任何字数波动不再触发压线截断（旧实现 798/800，余量 2 字）。
 const COMPOSE_MARGIN = 40;
 
+// ── 阶段 2 步骤 3（P1-2 检索时怀疑，2026-08-16，定稿 v2 §五）────────────
+// score = relevance × (α·trust + β·consistency) × landscapeAct
+//   （R4 景观激活乘数保留——审计 D 已实证步骤 2 加权；本步骤补 α/β 公式）
+//   - α/β 起步 0.6/0.4（R5）+ 梯度扫描准备：env SCORE_ALPHA/SCORE_BETA
+//     （0.5/0.5、0.7/0.3 扫描无需改码），参数先落盘（SCORE-PARAMS 日志）
+//   - trust 语义（LMS 置信度场）：⚠️置信 标注（integration_service 只注
+//     confidence<0.5 条目）→ 无标注默认 1.0（fail-open 不误杀）
+//   - R1 曲解修正（二选一禁双重惩罚）：trust<SCORE_TRUST_THRESHOLD(0.3) →
+//     降权 ×SCORE_DOWNGRADE_FACTOR(0.3) 或标 [doubt] lowconf（二选一；
+//     默认降权，SCORE_DOUBT_MODE=annotate 可切换）
+//   - R8 trust 归一化核验先行：TRUST-DIST 日志（批内分布 min/max/mean/
+//     p10/p50/p90）观测尺度漂移（B 级后 π̄ 变化影响 trust 尺度？）；阈值
+//     参数化（SCORE_TRUST_THRESHOLD）先落盘后进生产
+//   - consistency：静态入库默认 0.5（中性；无在线一致性信号时）+ 仅低信任
+//     窄路径在线多采样（SelfCheckGPT 工程同构：直调 LMS POST /recall 只读
+//     端点的 recall-time consistency——compute_consistency 召回时计算、
+//     count_reference=False 零持久化；按 text join）
+const SCORE_ALPHA_DEFAULT = 0.6;
+const SCORE_BETA_DEFAULT = 0.4;
+const SCORE_TRUST_THRESHOLD_DEFAULT = 0.3;
+const SCORE_DOUBT_MODE_DEFAULT = "downgrade"; // "downgrade" | "annotate"（R1 二选一）
+const SCORE_DOWNGRADE_FACTOR = 0.3;           // 定稿 v2 §五-3：trust<0.3 → ×0.3 降权
+const CONSISTENCY_STATIC_DEFAULT = 0.5;       // 静态入库默认（中性：无抽样印证信息）
+const CONSISTENCY_FETCH_TIMEOUT_MS = 4000;    // 窄路径 /recall 快路径（同 /landscape）
+
 // ----------------------------------------------------------------------
 // 召回L1-a（2026-08-11）：query 净化 —— 复刻 openclaw 自带 stripInboundMetadata
 // （dist/strip-inbound-meta），从 event.prompt 提取用户真实正文作为检索 query，
@@ -296,6 +321,10 @@ export function resolveConfig(pluginConfig) {
     // 阶段 2 思考链：thought 注入开关 + 激活度阈值（默认 0.05≈共享 ~8 字
     // 片段=真实主题关联；阈值无文献【待灰度】，灰度期观测定参）
     thoughtEnabled: cfg.thoughtEnabled !== false,
+    // P1-2（阶段 2 步骤 3）：lmsRecallConsistencyEnabled——低信任窄路径
+    // 在线多采样（SelfCheckGPT 工程同构）开关，默认开；关闭则 consistency
+    // 全走静态默认（fail-open 兼容路径）。
+    lmsRecallConsistencyEnabled: cfg.lmsRecallConsistencyEnabled !== false,
     thoughtActivationMin: Number.isFinite(cfg.thoughtActivationMin)
       ? Math.max(0, Math.min(1, cfg.thoughtActivationMin))
       : 0.05,
@@ -314,6 +343,9 @@ export function _resetRateLimitForTest() {
 // L1 生成约束（2026-08-14，状态调制生成·第一跳）：buildModulationConstraint /
 // modulationTier 导出供单测（纯函数，见下实现）。
 // 阶段 2 P1-1：fetchLandscape 已随函数声明 export（见上，不在此重复导出）。
+// 阶段 2 P1-2（2026-08-16）：score 公式/参数/R1 二选一/R8 核验纯函数均随函数
+// 声明 export（resolveScoreParams/normalizeEntryKey/trustDistributionStats/
+// computeFocusScore/applyLowTrustPolicy/fetchLmsRecallConsistency）。
 export { parseConfidenceTag, buildDoubtLayer, buildDiffuseProbe, buildLandscapeNarrative };
 
 // 仅供测试：读取限流状态
@@ -422,6 +454,63 @@ export async function fetchLandscape(cfg) {
   }
 }
 
+/**
+ * 直调 LMS POST /recall 取召回簇 consistency（阶段 2 P1-2 低信任窄路径
+ * 在线多采样，2026-08-16，定稿 v2 §五-4）。
+ *
+ * 只读语义（api/server.py /recall → recall_merged_readonly →
+ * recall_episodic_readonly(count_reference=False)）：不 process_turn、不调
+ * LLM、不写缓冲、不落盘、不计数引用——零持久化；内部 _attach_consistency
+ * 只更新进程内观测（Koriat 自一致性 = SelfCheckGPT 工程同构，recall-time
+ * 计算）与置信度窗口（记录侧，非状态场——doubt_baseline 只由 process_turn
+ * 的 observe_surprise 更新，本路径不触碰）。
+ *
+ * 返回 {normalizedText: {consistency, adaptiveConfidence, doubtVerdict}}；
+ * 无一致性字段 / 异常 / 超时 → null（fail-open）。仅 buildMemoryContext
+ * 在检测到低信任条目（trust < SCORE_TRUST_THRESHOLD）时调用——窄路径。
+ */
+export async function fetchLmsRecallConsistency(cfg, query) {
+  const url = `${cfg.lmsUrl}/recall`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CONSISTENCY_FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: String(query || "").slice(0, QUERY_MAX_CHARS),
+        k: Math.max(1, Math.min(20, Math.floor(cfg.k || 8))),
+        session_id: cfg.landscapeSid || LANDSCAPE_SID,
+      }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      logMiss(`consistency-non-2xx status=${resp.status} url=${url}`);
+      return null;
+    }
+    const data = await resp.json();
+    const results = Array.isArray(data && data.results) ? data.results : [];
+    const map = {};
+    for (const r of results) {
+      const t = String((r && r.text) || "").trim();
+      if (!t || typeof r.consistency !== "number") continue;
+      map[normalizeEntryKey(t)] = {
+        consistency: r.consistency,
+        adaptiveConfidence: typeof r.adaptive_confidence === "number"
+          ? r.adaptive_confidence : null,
+        doubtVerdict: r.doubt_verdict === true,
+      };
+    }
+    return Object.keys(map).length > 0 ? map : null;
+  } catch (err) {
+    const why = err && err.name === "AbortError" ? "timeout" : "network-error";
+    logMiss(`consistency-${why} url=${url} timeoutMs=${CONSISTENCY_FETCH_TIMEOUT_MS}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ── 阶段 1 弥散态专项（2026-08-16，v1.2 §四）：探测型注入 ──
 // 弥散态下“激活主题叙事”是零信息套话（3.08 教训：叙事型适配会鼓励
 // “弥散态是结晶前的东西”类空话）。改报可验证读数 + 显式异常标记：
@@ -502,9 +591,14 @@ function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
 
   // 读数行 2：漂移读数（可验证数字；缺字段不编）
   const driftBits = [];
-  if (typeof s.entropy_ratio === "number" && typeof s.entropy_ratio === "number") {
-    // entropy Δ：用 /soul 快照与阈值基准的偏离（若无法得 Δ 则只报熵比）
-    driftBits.push(`熵比${Number(ent).toFixed(4)}`);
+  // P2-4（审计 2026-08-16）：原条件 `typeof s.entropy_ratio === "number" &&
+  // typeof s.entropy_ratio === "number"` 是同义反复（同一表达式两次）；且漂移行
+  // "熵比"取 react 源、与弥散闸门的 /landscape entropy_norm 同标签不同源——
+  // 观测时易误读为同一值。修正：双源判断 + 标签区分来源（react/soul）。
+  if (typeof r.entropy_ratio === "number") {
+    driftBits.push(`熵比(react)${r.entropy_ratio.toFixed(4)}`);
+  } else if (typeof s.entropy_ratio === "number") {
+    driftBits.push(`熵比(soul)${s.entropy_ratio.toFixed(4)}`);
   }
   if (surprise !== null) driftBits.push(`惊讶${surprise.toFixed(2)}`);
   const driftLine = driftBits.length
@@ -515,8 +609,10 @@ function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
   const gapLine = "缺口：fok/low_confidence 不可读（无 /soul 缺口字段）";
 
   // 诊断标注（非读数，供诊断/决策消费）：
+  // P2-7（审计 2026-08-16）：明确来源——本行是阶段 1 v1.2 存量判据文本，
+  // 非本轮读数派生（诚实标注不变，来源显式化）；完整派生诊断属后续步骤。
   const diagLine =
-    "[诊断标注（非读数）：惊讶度呈 mse 线性、方向响应退化——弥散态特征，" +
+    "[诊断标注（非读数·存量判据）：惊讶度呈 mse 线性、方向响应退化——弥散态特征，" +
     "行为层过渡补丁，不等同于状态场修复]";
 
   const out = [stateLine, driftLine, gapLine, diagLine]
@@ -579,9 +675,10 @@ function buildLandscapeNarrative(reactData, soulData, landscapeData) {
   if (entropyRatio !== null && entropyRatio >= DIFFUSE_ENTROPY_RATIO) {
     const probe = buildDiffuseProbe(react, st, entropyRatio, landscapeData);
     if (probe) {
-      // ≤200 字硬约束同样适用于探测段（定稿 v2 §四-2：景观叙事 ≤200）
+      // ≤200 字硬约束同样适用于探测段（定稿 v2 §四-2：景观叙事 ≤200）；
+      // slice(0, 200-1)+"…" 保证截断后恰好 ≤200（旧实现 200+"…"=201 破界）
       if (probe.length > LANDSCAPE_MAX_CHARS) {
-        return `${probe.slice(0, LANDSCAPE_MAX_CHARS)}…`;
+        return `${probe.slice(0, LANDSCAPE_MAX_CHARS - 1)}…`;
       }
       return probe;
     }
@@ -650,8 +747,8 @@ function buildLandscapeNarrative(reactData, soulData, landscapeData) {
 
   if (clauses.length === 0) return null;
   let out = `景观:${clauses.join("｜")}`;
-  // ≤200 字硬约束（定稿 v2 §四-2）
-  if (out.length > LANDSCAPE_MAX_CHARS) out = `${out.slice(0, LANDSCAPE_MAX_CHARS)}…`;
+  // ≤200 字硬约束（定稿 v2 §四-2）；slice(0, 200-1)+"…" 保证截断后 ≤200
+  if (out.length > LANDSCAPE_MAX_CHARS) out = `${out.slice(0, LANDSCAPE_MAX_CHARS - 1)}…`;
   return out;
 }
 
@@ -876,6 +973,17 @@ function logThoughtFallback(from, to) {
     appendFileSync(DEBUG_LOG_FILE, `[${new Date().toISOString()}] THOUGHT-FALLBACK ${from}->${to}\n`);
   } catch { /* 日志失败忽略：不引入新崩溃点 */ }
 }
+// P2-1（审计 2026-08-16）：SOUL-TRUNC 日志——C1 判据"回魂段截断率 ≥100 轮
+// 稳定"的直接数据源（此前仅 THOUGHT-FALLBACK 可作代理）。buildSoulText 最终
+// slice 处发射（回魂段实际被截断才记）。
+function logSoulTrunc(fromLen, maxChars) {
+  try {
+    appendFileSync(
+      DEBUG_LOG_FILE,
+      `[${new Date().toISOString()}] SOUL-TRUNC from=${fromLen} max=${maxChars}\n`,
+    );
+  } catch { /* 日志失败忽略：不引入新崩溃点 */ }
+}
 
 /**
  * 按激活度取 1-2 条 thought（设计 §三-3；R7 灰度 2026-08-16）。规则：
@@ -912,7 +1020,10 @@ export function pickThoughts(query, thoughts, cfg, maxItems = THOUGHT_INJECT_MAX
     .slice(0, Math.max(THOUGHT_INJECT_MIN, maxItems));
 }
 
-/** 组装 thought 注入行（≤THOUGHT_MAX_CHARS/条，1-2 条；无命中 → null）。 */
+/** 组装 thought 注入行（≤THOUGHT_MAX_CHARS/条，1-2 条；无命中 → null）。
+ * P2-3（审计 2026-08-16）：返回 {line, count}——条数以 pickThoughts 实际选中数
+ * 计，替代旧 `includes("｜") ? 2 : 1` 启发式（单条 thought 文本含"｜"会误计；
+ * 降级轮无 INJECT n=1 记录 → 观测连续性缺口）。 */
 export function buildThoughtLayer(query, thoughts, cfg, maxItems = THOUGHT_INJECT_MAX) {
   const picked = pickThoughts(query, thoughts, cfg, maxItems);
   if (picked.length === 0) return null;
@@ -922,7 +1033,7 @@ export function buildThoughtLayer(query, thoughts, cfg, maxItems = THOUGHT_INJEC
     const topic = thought.topic ? `【${thought.topic}】` : "";
     return `${topic}${text}`;
   });
-  return `thought:${bits.join("｜")}`;
+  return { line: `thought:${bits.join("｜")}`, count: picked.length };
 }
 
 /** 行动层（阶段 4，设计 v1.0 §三-6）：把**激活的 thought** 携带的行动意向
@@ -1007,18 +1118,19 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null,
       ? pickedThoughts.map((p) => p.thought)
       : loadRecentThoughts();
     // 灰度：先尝试 2 条（THOUGHT_INJECT_MAX），超预算降 1 条
-    let thoughtLine = buildThoughtLayer(query, thoughts, cfgT, THOUGHT_INJECT_MAX);
-    if (thoughtLine) {
-      parts.push(thoughtLine);
+    const thoughtLayer = buildThoughtLayer(query, thoughts, cfgT, THOUGHT_INJECT_MAX);
+    if (thoughtLayer && thoughtLayer.line) {
+      parts.push(thoughtLayer.line);
       const provisional = `[回魂] ${parts.join(" / ")}`;
       if (provisional.length > maxChars) {
         // R7 灰度降级：2 条超预算 → 1 条（回魂段永不先截，丢 thought 不丢状态）
         parts.pop();
-        const oneLine = buildThoughtLayer(query, thoughts, cfgT, 1);
-        if (oneLine) parts.push(oneLine);
+        const oneLayer = buildThoughtLayer(query, thoughts, cfgT, 1);
+        if (oneLayer && oneLayer.line) parts.push(oneLayer.line);
         logThoughtFallback(2, 1);
+        logThoughtInject(1); // P2-3：降级轮仍记录实际注入条数（观测连续性）
       } else {
-        logThoughtInject(thoughtLine.includes("｜") ? 2 : 1);
+        logThoughtInject(thoughtLayer.count); // P2-3：实际条数（非"｜"启发式）
       }
     }
   }
@@ -1043,8 +1155,139 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null,
     return null;
   }
   let out = `[回魂] ${parts.join(" / ")}`;
-  if (out.length > maxChars) out = `${out.slice(0, maxChars)}…`;
+  if (out.length > maxChars) {
+    // P2-1（审计 2026-08-16）：SOUL-TRUNC 日志——C1 判据"回魂段截断率 ≥100 轮
+    // 稳定"的直接数据源（此前仅 THOUGHT-FALLBACK 代理）
+    logSoulTrunc(out.length, maxChars);
+    out = `${out.slice(0, maxChars)}…`;
+  }
   return out;
+}
+
+// ── 阶段 2 步骤 3（P1-2 检索时怀疑）：score 公式 + R1 二选一 + R8 核验 ──
+// 全部纯函数（零副作用），供 test-plugin.mjs 直接单测；热路径只读 process.env。
+
+/**
+ * 解析 P1-2 score 参数（R5 参数先落盘；env 驱动，默认 0.6/0.4 起步）。
+ * 梯度扫描准备：SCORE_ALPHA/SCORE_BETA 可切 0.5/0.5、0.7/0.3 无需改码。
+ * 无效值回退默认（fail-open）；doubtMode 只认 "annotate"（其余一律 downgrade）。
+ */
+export function resolveScoreParams(env) {
+  const e = env && typeof env === "object" ? env : {};
+  const num = (v, dflt) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : dflt;
+  };
+  const alpha = num(e.SCORE_ALPHA, SCORE_ALPHA_DEFAULT);
+  const beta = num(e.SCORE_BETA, SCORE_BETA_DEFAULT);
+  const trustThreshold = num(e.SCORE_TRUST_THRESHOLD, SCORE_TRUST_THRESHOLD_DEFAULT);
+  const modeRaw = String(e.SCORE_DOUBT_MODE || SCORE_DOUBT_MODE_DEFAULT).toLowerCase();
+  return {
+    scoreAlpha: alpha,
+    scoreBeta: beta,
+    trustThreshold,
+    doubtMode: modeRaw === "annotate" ? "annotate" : "downgrade",
+  };
+}
+
+/** 条目文本归一化键：剥离尾部 ⚠️置信 标注（integration_service 只注 conf<0.5
+ * 条目，glue 侧文本带标注、LMS 直调侧不带 → join 前必须归一）。 */
+export function normalizeEntryKey(text) {
+  return String(text || "")
+    .trim()
+    .replace(/\s*⚠️置信[\d.]+(?:驳\d+)?$/, "")
+    .replace(/\s+/g, " ");
+}
+
+/**
+ * score 公式（定稿 v2 §五-1）：score = relevance × (α·trust + β·consistency)。
+ * R4（§四-3）景观激活乘数保留：调用方自行乘 landscapeAct（见 buildContextText）。
+ * 数值防御：非有限/越界值回退中性（fail-open 不误杀）。
+ */
+export function computeFocusScore(relevance, trust, consistency, alpha, beta) {
+  const a = Number.isFinite(alpha) ? alpha : SCORE_ALPHA_DEFAULT;
+  const b = Number.isFinite(beta) ? beta : SCORE_BETA_DEFAULT;
+  const t = Number.isFinite(trust) ? Math.max(0, Math.min(1, trust)) : 1.0;
+  const c = Number.isFinite(consistency)
+    ? Math.max(0, Math.min(1, consistency)) : CONSISTENCY_STATIC_DEFAULT;
+  const rel = Number.isFinite(relevance) ? Math.max(0, relevance) : 1.0;
+  return rel * (a * t + b * c);
+}
+
+/**
+ * R1 曲解修正（定稿 v2 §五-3）：trust < 阈值 → 降权 ×0.3 或 [doubt] lowconf
+ * 标注，**二选一禁双重惩罚**（构造上互斥：降权模式不标注、标注模式不降权）。
+ * trust 无标注（parseConfidenceTag ?? 1.0）时恒 ≥1 > 阈值 → 本函数天然不触发。
+ * 返回 {score, annotated}。
+ */
+export function applyLowTrustPolicy(score, trust, params) {
+  const thr = Number.isFinite(params && params.trustThreshold)
+    ? params.trustThreshold : SCORE_TRUST_THRESHOLD_DEFAULT;
+  if (!(trust < thr)) return { score, annotated: false };
+  if (params && params.doubtMode === "annotate") {
+    return { score, annotated: true }; // 标注不降权
+  }
+  return { score: score * SCORE_DOWNGRADE_FACTOR, annotated: false }; // 降权不标注
+}
+
+/**
+ * R8 trust 归一化核验先行：批内 trust 分布统计（纯函数）。
+ * 返回 {count, min, max, mean, p10, p50, p90} 或 null（无有效值）。
+ * 用途：TRUST-DIST 日志数据源——定阈值 0.3 前先核验分布是否尺度漂移
+ * （B 级后 π̄ 变化影响 trust 尺度？）；观测端发现漂移即可用
+ * SCORE_TRUST_THRESHOLD 参数化调整（先落盘后进生产）。
+ */
+export function trustDistributionStats(values) {
+  const v = (Array.isArray(values) ? values : [])
+    .filter((x) => typeof x === "number" && Number.isFinite(x));
+  if (v.length === 0) return null;
+  const sorted = [...v].sort((a, b) => a - b);
+  const p = (q) => {
+    const k = (sorted.length - 1) * q;
+    const f = Math.floor(k);
+    const c = Math.ceil(k);
+    if (f === c) return sorted[k];
+    return sorted[f] * (c - k) + sorted[c] * (k - f);
+  };
+  return {
+    count: v.length,
+    min: sorted[0],
+    max: sorted[sorted.length - 1],
+    mean: v.reduce((s, x) => s + x, 0) / v.length,
+    p10: p(0.1),
+    p50: p(0.5),
+    p90: p(0.9),
+  };
+}
+
+// P1-2 观测日志（与 logMiss 同模式；日志失败绝不影响主流程）
+let scoreParamsLogged = false;
+function logScoreParams(sp) {
+  if (scoreParamsLogged) return; // 每进程一次（参数先落盘）
+  scoreParamsLogged = true;
+  try {
+    appendFileSync(
+      DEBUG_LOG_FILE,
+      `[${new Date().toISOString()}] SCORE-PARAMS alpha=${sp.scoreAlpha.toFixed(2)} beta=${sp.scoreBeta.toFixed(2)} mode=${sp.doubtMode} trust_threshold=${sp.trustThreshold.toFixed(2)} downgrade_factor=${SCORE_DOWNGRADE_FACTOR} consistency_default=${CONSISTENCY_STATIC_DEFAULT}\n`,
+    );
+  } catch { /* 日志失败忽略 */ }
+}
+function logTrustDist(stats, untagged) {
+  if (!stats) return;
+  try {
+    appendFileSync(
+      DEBUG_LOG_FILE,
+      `[${new Date().toISOString()}] TRUST-DIST tagged_n=${stats.count} min=${stats.min.toFixed(3)} max=${stats.max.toFixed(3)} mean=${stats.mean.toFixed(3)} p10=${stats.p10.toFixed(3)} p50=${stats.p50.toFixed(3)} p90=${stats.p90.toFixed(3)} untagged=${untagged}\n`,
+    );
+  } catch { /* 日志失败忽略 */ }
+}
+function logScoreDoubt(mode, trust, before, after, annotated, snippet) {
+  try {
+    appendFileSync(
+      DEBUG_LOG_FILE,
+      `[${new Date().toISOString()}] SCORE-DOUBT mode=${mode} trust=${Number(trust).toFixed(2)} score=${Number(before).toFixed(4)}->${Number(after).toFixed(4)} annotated=${annotated} text=${String(snippet).slice(0, 30)}\n`,
+    );
+  } catch { /* 日志失败忽略 */ }
 }
 
 /**
@@ -1061,7 +1304,7 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null,
  *   默认 null）。它的 action 字段（行动意向四问）经 buildActionLayer 注入⑥行动层；
  *   无激活 thought / 无 action → 回退占位。仅展示意向，零执行动作。
  */
-export function buildContextText(data, query, maxChars, skipSelfRef = false, reactData = null, activatedThought = null) {
+export function buildContextText(data, query, maxChars, skipSelfRef = false, reactData = null, activatedThought = null, consistencyByText = null) {
   if (!data || typeof data !== "object") {
     logMiss("recall-invalid-response"); // P0-1：/recall 响应结构异常
     return null;
@@ -1072,30 +1315,71 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
     return null;
   }
 
-  // ④ 焦点记忆：3-5 条（Cowan 4±1），六层衔接加权（R4，定稿 v2 §四-3）：
-  //    “相关性×trust×景观激活”加权取舍（滤伪相关——Power of Noise）。
-  //    相关性 = scores.total（glue 协同分）；trust = ⚠️置信 标注（parseConfidenceTag，
-  //    无标注默认 1.0）；景观激活 = scores.lms_activation（LMS 激活加权分量）。
-  //    加权分 = relevance × trust × landscape_activation，降序取前 3-5 条。
-  //    精确去重（同文不重复注入）。缺分字段的条目用 1.0 中性值（fail-open 不误杀）。
+  // ④ 焦点记忆：3-5 条（Cowan 4±1），六层衔接加权（R4，定稿 v2 §四-3）+
+  //    P1-2 score 公式（§五-1，阶段 2 步骤 3）：
+  //      score = relevance × (α·trust + β·consistency) × landscapeAct
+  //    相关性 = scores.total（glue 协同分）；trust = ⚠️置信 标注
+  //    （parseConfidenceTag，无标注默认 1.0——integration_service 只注
+  //    confidence<0.5 条目，故 trust 分布天然双峰：{1.0 无标注} ∪ {<0.5 标注}）；
+  //    consistency = 窄路径 LMS recall-time 一致性（consistencyByText，按归一化
+  //    text join）或静态默认 0.5（中性，无抽样印证信息不惩罚不奖励）；
+  //    景观激活 = scores.lms_activation（R4 乘数保留）。
+  //    R1（§五-3）：trust < SCORE_TRUST_THRESHOLD(0.3) → 降权 ×0.3 或
+  //    [doubt] lowconf 标注**二选一**（禁双重惩罚；默认降权，
+  //    SCORE_DOUBT_MODE=annotate 切换）——不是接口摆设，降权可见于排序、
+  //    标注可见于注入文本。
+  //    R8（§五-2）：trust 归一化核验先行——TRUST-DIST 日志（批内分布
+  //    min/max/mean/p10/p50/p90，定阈值前核验尺度漂移；阈值参数化可调）。
+  //    精确去重（同文不重复注入）。
+  //    P2-6（审计 2026-08-16 已知行为记录）：缺分字段条目用 1.0 中性值
+  //    （fail-open 不误杀）→ 无分条目可反超有分条目（权 1.00 排首）；glue
+  //    实测恒带 scores，风险低，此处记录备查。
+  const sp = resolveScoreParams(process.env);
   const items = [];
   const seenTexts = new Set();
+  const trustTagged = [];
+  let untaggedCount = 0;
   for (const it of results) {
     const text = typeof it?.text === "string" ? it.text.trim().replace(/\s+/g, " ") : "";
     if (!text || seenTexts.has(text)) continue;
     seenTexts.add(text);
     const relevance = typeof it?.scores?.total === "number" ? it.scores.total : 1.0;
-    const trust = parseConfidenceTag(text) ?? 1.0;
+    const trustTag = parseConfidenceTag(text);
+    const trust = trustTag ?? 1.0;
     const landscapeAct = typeof it?.scores?.lms_activation === "number"
       ? it.scores.lms_activation : 1.0;
+    // consistency：窄路径 map（按归一化 text join，P1-2）优先；否则静态默认
+    const consEntry = consistencyByText && typeof consistencyByText === "object"
+      ? consistencyByText[normalizeEntryKey(text)] : null;
+    const consistency = consEntry && typeof consEntry.consistency === "number"
+      ? consEntry.consistency : CONSISTENCY_STATIC_DEFAULT;
+    // score 公式（P1-2）+ R4 景观激活乘数保留
+    const baseWeight = computeFocusScore(
+      relevance, trust, consistency, sp.scoreAlpha, sp.scoreBeta) * landscapeAct;
+    const policy = applyLowTrustPolicy(baseWeight, trust, sp);
+    if (trustTag !== null) {
+      trustTagged.push(trustTag);
+    } else {
+      untaggedCount += 1;
+    }
+    if (trust < sp.trustThreshold) {
+      // R1 生效观测（灵魂指标：二选一生效不是接口摆设）
+      logScoreDoubt(sp.doubtMode, trust, baseWeight, policy.score, policy.annotated, text);
+    }
     items.push({
       text,
       origin: typeof it?.origin === "string" && it.origin ? it.origin : "",
       score: typeof it?.scores?.total === "number" ? it.scores.total : null,
-      weight: relevance * trust * landscapeAct,
+      weight: policy.score,
+      lowTrustAnnotated: policy.annotated,
     });
   }
-  // 六层衔接加权（R4）：按 相关性×trust×景观激活 降序取舍（滤伪相关）
+  // R8：批内 trust 分布核验日志（仅真实标注值；无标注计数另记）
+  if (trustTagged.length > 0) {
+    logTrustDist(trustDistributionStats(trustTagged), untaggedCount);
+  }
+  // 六层衔接加权（R4+P1-2）：score 降序取舍（滤伪相关）；低信任条目经降权沉底
+  // /标注可见（审计 D 同法：高相关低信任沉底）
   items.sort((a, b) => b.weight - a.weight);
   const picked = items.slice(0, FOCUS_MAX_ITEMS);
   if (picked.length === 0) {
@@ -1105,11 +1389,13 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
 
   const lines = [`[记忆注入] 焦点记忆 ${picked.length} 条（按"${String(query).slice(0, 60)}"激活加权召回）：`];
   for (const [i, it] of picked.entries()) {
-    // 来源 + 置信度标注 + 加权分（R4 可观测）：[origin·分total·权w]；无分时仅标来源
+    // 来源 + 置信度标注 + 加权分（R4/P1-2 可观测）：[origin·分total·权score]；
+    // 无分时仅标来源；R1 annotate 模式追加 [doubt] lowconf（降权模式不标注——
+    // 禁双重惩罚，降权已体现在权值）
     const meta = it.origin
       ? `[${it.origin}${it.score !== null ? `·分${it.score.toFixed(2)}` : ""}·权${it.weight.toFixed(2)}]`
       : "";
-    lines.push(`${i + 1}. ${meta} ${it.text}`);
+    lines.push(`${i + 1}. ${meta} ${it.text}${it.lowTrustAnnotated ? " [doubt] lowconf" : ""}`);
   }
 
   // ⑤ 质疑层 + ⑥ 行动层（阶段 4：激活的 thought 才带行动意向；无则占位）
@@ -1229,6 +1515,7 @@ export async function buildMemoryContext(prompt, pluginConfig) {
     logMiss("plugin-disabled"); // P0-1
     return null;
   }
+  logScoreParams(resolveScoreParams(process.env)); // P1-2 参数先落盘（每进程一次）
   // 召回L1-a（2026-08-11）：query 净化 —— 剥离 openclaw 元数据块/时间戳/
   // 子代理模板，取用户真实正文前 QUERY_MAX_CHARS 字；纯模板/心跳 → null 不注入；
   // 净化异常回落原逻辑（fail-open）。
@@ -1293,8 +1580,24 @@ export async function buildMemoryContext(prompt, pluginConfig) {
     // 记忆块预算 = 注入预算 - 回魂段 - "\n\n" 分隔符（与 composeContext 的
     // keep=soulText.length+2 对齐，避免 compose 二次截断吃掉尾部结构层）
     const memoryBudget = Math.max(200, injectBudget - (soulText ? soulText.length + 2 : 0));
-    // reactData 透传给 buildContextText：质疑层需要全局 precision 信号
-    const memoryText = buildContextText(recallData, query, memoryBudget, Boolean(soulText), reactData, pickedThought);
+    // P1-2 低信任窄路径（定稿 v2 §五-4）：批内存在 trust<阈值 条目 → 直调 LMS
+    // POST /recall（只读：count_reference=False、零持久化）取 recall-time
+    // consistency（Koriat 自一致性 = SelfCheckGPT 工程同构）——常态（无低信任
+    // 条目）零额外调用，consistency 全走静态默认 0.5。失败 fail-open → null。
+    let consistencyByText = null;
+    if (cfg.lmsRecallConsistencyEnabled && recallData && Array.isArray(recallData.results)) {
+      const sp = resolveScoreParams(process.env);
+      const lowTrustPresent = recallData.results.some((it) => {
+        const t = parseConfidenceTag(it && it.text);
+        return t !== null && t < sp.trustThreshold;
+      });
+      if (lowTrustPresent) {
+        consistencyByText = await fetchLmsRecallConsistency(cfg, query) || null;
+      }
+    }
+    // reactData 透传给 buildContextText：质疑层需要全局 precision 信号；
+    // consistencyByText：P1-2 consistency 窄路径数据（缺省 null → 静态默认）
+    const memoryText = buildContextText(recallData, query, memoryBudget, Boolean(soulText), reactData, pickedThought, consistencyByText);
 
     return composeContext(soulText, memoryText, injectBudget);
   } catch (err) {

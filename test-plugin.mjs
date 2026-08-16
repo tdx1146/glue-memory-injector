@@ -33,6 +33,12 @@ const {
   pickThoughts,
   buildThoughtLayer,
   fetchLandscape,
+  fetchLmsRecallConsistency,
+  resolveScoreParams,
+  normalizeEntryKey,
+  trustDistributionStats,
+  computeFocusScore,
+  applyLowTrustPolicy,
   _resetRateLimitForTest,
   _getRateLimitStateForTest,
 } = await import("./memory-recall.js");
@@ -352,10 +358,10 @@ ok("P1-1 景观叙事：/landscape 缺失 → 回退 react/soul 状态派生（f
   assert.ok(narr === null || !narr.includes("[异常]"), "非弥散态不应输出探测段");
 });
 
-ok("P1-1 六层衔接加权（R4）：焦点记忆按 相关性×trust×景观激活 取舍（滤伪相关）", () => {
+ok("P1-2 score 公式（R4+P1-2）：焦点记忆按 relevance×(α·trust+β·consistency)×landscapeAct 取舍（高相关低信任沉底）", () => {
   const data = {
     results: [
-      // 高相关性 + 低 trust（⚠️置信0.2）→ 应被滤
+      // 高相关性 + 低 trust（⚠️置信0.2）→ 应被滤（降权 ×0.3 沉底）
       { id: "a", text: "高相关低信任条目 ⚠️置信0.2驳3", origin: "lms", scores: { total: 0.9, lms_activation: 0.9 } },
       // 中相关性 + 高 trust → 应胜出
       { id: "b", text: "中相关高信任条目", origin: "lms", scores: { total: 0.7, lms_activation: 0.8 } },
@@ -365,17 +371,197 @@ ok("P1-1 六层衔接加权（R4）：焦点记忆按 相关性×trust×景观�
   };
   const out = buildContextText(data, "测试加权", 800, true);
   assert.ok(out && out.includes("[记忆注入]"), "应输出记忆注入块");
-  // 加权分 = relevance × trust × landscape_activation：
-  //   a: 0.9×0.2×0.9 = 0.162
-  //   b: 0.7×1.0×0.8 = 0.560
-  //   c: 0.4×1.0×0.9 = 0.360
-  // 排序：b > c > a（低 trust 的 a 沉底，滤伪相关）
+  // score = relevance × (α·trust + β·consistency) × landscapeAct（α=0.6/β=0.4 默认，
+  // consistency 静态默认 0.5）+ R1 降权（trust=0.2 < 0.3 → ×0.3）：
+  //   a: 0.9×(0.6×0.2+0.4×0.5)×0.9 = 0.2592 → ×0.3 = 0.0778（权0.08）
+  //   b: 0.7×(0.6×1.0+0.4×0.5)×0.8 = 0.448（权0.45）
+  //   c: 0.4×(0.6×1.0+0.4×0.5)×0.9 = 0.288（权0.29）
+  // 排序：b > c > a（高相关低信任沉底——审计 D 同法）
   const idxA = out.indexOf("高相关低信任");
   const idxB = out.indexOf("中相关高信任");
   const idxC = out.indexOf("低相关高激活");
   assert.ok(idxA !== -1 && idxB !== -1 && idxC !== -1, "三条都应注入");
-  assert.ok(idxB < idxC && idxC < idxA, `trust 参与取舍：b(0.56) > c(0.36) > a(0.16)，实际顺序 ${idxB} < ${idxC} < ${idxA}`);
-  assert.ok(out.includes("权0.56"), `应显示加权分 权0.56，实际 ${out}`);
+  assert.ok(idxB < idxC && idxC < idxA, `score 参与取舍：b(0.45) > c(0.29) > a(0.08)，实际顺序 ${idxB} < ${idxC} < ${idxA}`);
+  assert.ok(out.includes("权0.45"), `应显示加权分 权0.45，实际 ${out}`);
+  // R1 默认降权模式：低信任条目只降权、不标注（禁双重惩罚）
+  assert.ok(!out.includes("[doubt] lowconf"), "降权模式不应标注 [doubt] lowconf（禁双重惩罚）");
+});
+
+// ── 阶段 2 步骤 3（P1-2 检索时怀疑，2026-08-16，定稿 v2 §五）────────────
+ok("P1-2 score 公式：α/β env 生效（0.6/0.4 默认 + 梯度扫描切换 + 参数先落盘）", () => {
+  const dflt = resolveScoreParams({});
+  assert.equal(dflt.scoreAlpha, 0.6, "α 默认 0.6（R5 起步）");
+  assert.equal(dflt.scoreBeta, 0.4, "β 默认 0.4");
+  assert.equal(dflt.trustThreshold, 0.3, "trust 阈值默认 0.3");
+  assert.equal(dflt.doubtMode, "downgrade", "R1 默认降权");
+  // 梯度扫描（R5）：0.5/0.5、0.7/0.3 无需改码
+  const g1 = resolveScoreParams({ SCORE_ALPHA: "0.5", SCORE_BETA: "0.5" });
+  assert.equal(g1.scoreAlpha, 0.5);
+  assert.equal(g1.scoreBeta, 0.5);
+  const g2 = resolveScoreParams({ SCORE_ALPHA: "0.7", SCORE_BETA: "0.3" });
+  assert.equal(g2.scoreAlpha, 0.7);
+  assert.equal(g2.scoreBeta, 0.3);
+  // 无效值回退默认（fail-open）
+  const bad = resolveScoreParams({ SCORE_ALPHA: "abc", SCORE_BETA: "2.5" });
+  assert.equal(bad.scoreAlpha, 0.6);
+  assert.equal(bad.scoreBeta, 0.4);
+  // 公式数值：relevance=0.9, trust=0.2, consistency=0.5 → 0.9×(0.6×0.2+0.4×0.5)=0.288
+  assert.ok(Math.abs(computeFocusScore(0.9, 0.2, 0.5, 0.6, 0.4) - 0.288) < 1e-9);
+  // consistency 静态默认 0.5 生效（缺省路径）
+  assert.ok(Math.abs(computeFocusScore(0.7, 1.0, undefined, 0.6, 0.4) - 0.7 * 0.8) < 1e-9);
+});
+
+ok("P1-2 R1 二选一：trust<0.3 降权（默认）→ 不标注，禁双重惩罚", () => {
+  const out = buildContextText({
+    results: [{ id: "a", text: "低信任条目 ⚠️置信0.2驳3", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } }],
+  }, "测试", 800, true);
+  // base = 0.9×(0.12+0.2)×1.0 = 0.288 → ×0.3 = 0.0864（权0.09）
+  assert.ok(out.includes("权0.09"), `降权生效（0.288→0.0864 权0.09），实际 ${out}`);
+  assert.ok(!out.includes("[doubt] lowconf"), "降权模式不标注（禁双重惩罚）");
+});
+
+ok("P1-2 R1 二选一：annotate 模式 → 标 [doubt] lowconf 不降权（SCORE_DOUBT_MODE 可切换）", () => {
+  process.env.SCORE_DOUBT_MODE = "annotate";
+  try {
+    const out = buildContextText({
+      results: [{ id: "a", text: "低信任条目 ⚠️置信0.2驳3", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } }],
+    }, "测试", 800, true);
+    assert.ok(out.includes("[doubt] lowconf"), `应标注 [doubt] lowconf，实际 ${out}`);
+    assert.ok(out.includes("权0.29"), `标注模式不降权（权0.29），实际 ${out}`);
+    assert.ok(!out.includes("权0.09"), "标注模式不得降权（禁双重惩罚）");
+  } finally {
+    delete process.env.SCORE_DOUBT_MODE;
+  }
+});
+
+ok("P1-2 R1 禁双重惩罚：纯函数构造互斥（降权 XOR 标注）", () => {
+  const p = { doubtMode: "downgrade", trustThreshold: 0.3 };
+  const d = applyLowTrustPolicy(0.288, 0.2, p);
+  assert.ok(Math.abs(d.score - 0.288 * 0.3) < 1e-9, "降权 ×0.3");
+  assert.equal(d.annotated, false, "降权不标注");
+  const a = applyLowTrustPolicy(0.288, 0.2, { doubtMode: "annotate", trustThreshold: 0.3 });
+  assert.equal(a.score, 0.288, "标注不降权");
+  assert.equal(a.annotated, true, "标注生效");
+  const hi = applyLowTrustPolicy(0.288, 0.8, p);
+  assert.equal(hi.score, 0.288, "trust≥阈值不惩罚");
+  assert.equal(hi.annotated, false);
+  const eq = applyLowTrustPolicy(0.288, 0.3, p);
+  assert.equal(eq.score, 0.288, "trust==0.3 不触发（定稿：trust<0.3）");
+  assert.equal(eq.annotated, false);
+});
+
+ok("P1-2 R8 trust 归一化核验：trustDistributionStats 分布统计（定阈值前核验尺度漂移）", () => {
+  const s = trustDistributionStats([0.1, 0.2, 0.3, 0.4, 1.0]);
+  assert.equal(s.count, 5);
+  assert.equal(s.min, 0.1);
+  assert.equal(s.max, 1.0);
+  assert.equal(s.p50, 0.3);
+  assert.ok(Math.abs(s.mean - 0.4) < 1e-9);
+  assert.equal(trustDistributionStats([]), null);
+  assert.equal(trustDistributionStats([NaN, "x"]), null);
+});
+
+ok("P1-2 consistency：静态默认 0.5 + 窄路径 map 覆盖（按归一化 text join）", () => {
+  const base = { results: [
+    { id: "a", text: "低信任低一致 ⚠️置信0.2驳2", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+  ] };
+  // 无 map（常态）→ consistency 静态默认 0.5：0.9×(0.12+0.2)×1.0=0.288 → ×0.3=0.0864（权0.09）
+  const out1 = buildContextText(base, "测试", 800, true);
+  assert.ok(out1.includes("权0.09"), `静态默认路径，实际 ${out1}`);
+  // 窄路径 map（真实 consistency=0.9，Koriat：同主题印证可部分救回）：
+  // 0.9×(0.12+0.36)×1.0 = 0.432 → 降权 ×0.3 = 0.1296（权0.13）
+  const map = { [normalizeEntryKey("低信任低一致 ⚠️置信0.2驳2")]: { consistency: 0.9 } };
+  const out2 = buildContextText(base, "测试", 800, true, null, null, map);
+  assert.ok(out2.includes("权0.13"), `窄路径一致性生效（0.0864→0.1296），实际 ${out2}`);
+});
+
+await okAsync("P1-2 窄路径：低信任条目存在 → 直调 LMS /recall 取 consistency（只读）", async () => {
+  const lmsState = { recallHits: 0 };
+  const lmsServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/landscape/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ session_id: "main", landscape: { num_nodes: 2, activation: { entropy_norm: 0.5, active_nodes: 2, top_activated: [{ node: 1, sigma: 0.6 }, { node: 2, sigma: 0.4 }] } } }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/recall")) {
+        lmsState.recallHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ results: [
+          { text: "低信任低一致 ⚠️置信0.2驳2", consistency: 0.9, adaptive_confidence: 0.2, doubt_verdict: true },
+          { text: "另一条记忆", consistency: 0.55, adaptive_confidence: 0.8, doubt_verdict: false },
+        ] }));
+        return;
+      }
+      res.writeHead(404);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => lmsServer.listen(0, "127.0.0.1", r));
+  const { server, port } = await startMockGlue([
+    { id: "a", text: "低信任低一致 ⚠️置信0.2驳2", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+  ], { soul: null });
+  try {
+    _resetRateLimitForTest();
+    const text = await buildMemoryContext("测试低信任", {
+      glueUrl: `http://127.0.0.1:${port}`,
+      lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
+      landscapeSid: "main",
+      minIntervalMs: 0,
+      maxChars: 800,
+    });
+    assert.ok(text && text.includes("[记忆注入]"), "应注入");
+    // 窄路径触发：权 = 0.9×(0.6×0.2+0.4×0.9)×1.0 = 0.432 → ×0.3 = 0.1296（权0.13）
+    assert.ok(text.includes("权0.13"), `窄路径 consistency 生效（权0.13），实际 ${text}`);
+    assert.equal(lmsState.recallHits, 1, "低信任存在 → 恰好一次 LMS /recall（窄路径）");
+  } finally {
+    server.close();
+    lmsServer.close();
+  }
+});
+
+await okAsync("P1-2 窄路径：无低信任条目（常态）→ 零额外 LMS /recall 调用", async () => {
+  const lmsState = { recallHits: 0 };
+  const lmsServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/landscape/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ session_id: "main", landscape: { num_nodes: 2, activation: { entropy_norm: 0.5, active_nodes: 2, top_activated: [{ node: 1, sigma: 0.6 }, { node: 2, sigma: 0.4 }] } } }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/recall")) {
+        lmsState.recallHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ results: [] }));
+        return;
+      }
+      res.writeHead(404);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => lmsServer.listen(0, "127.0.0.1", r));
+  const { server, port } = await startMockGlue([
+    { id: "b", text: "高信任条目", origin: "lms", scores: { total: 0.7, lms_activation: 0.8 } },
+  ], { soul: null });
+  try {
+    _resetRateLimitForTest();
+    const text = await buildMemoryContext("测试高信任", {
+      glueUrl: `http://127.0.0.1:${port}`,
+      lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
+      landscapeSid: "main",
+      minIntervalMs: 0,
+      maxChars: 800,
+    });
+    assert.ok(text && text.includes("[记忆注入]"), "应注入");
+    assert.equal(lmsState.recallHits, 0, "无低信任条目 → 零窄路径调用（consistency 全静态默认）");
+  } finally {
+    server.close();
+    lmsServer.close();
+  }
 });
 
 ok("P1-1 thought 注入（R7）：激活 query → 1 条默认注入", () => {
@@ -385,15 +571,17 @@ ok("P1-1 thought 注入（R7）：激活 query → 1 条默认注入", () => {
     { text: "完全不相关的日常琐事记录", topic: "琐事" },
   ];
   const cfg = { thoughtEnabled: true, thoughtActivationMin: 0.05 };
-  const line = buildThoughtLayer("sigma_norm 缓漂 退活 趋势 反弹", thoughts, cfg);
-  assert.ok(line && line.startsWith("thought:"), `激活 query 应注入 thought，实际 ${line}`);
-  assert.ok(line.includes("σ振荡"), `应注入最激活的 thought（σ振荡），实际 ${line}`);
-  assert.ok(!line.includes("琐事"), "无关 thought 不应注入");
+  const layer = buildThoughtLayer("sigma_norm 缓漂 退活 趋势 反弹", thoughts, cfg);
+  assert.ok(layer && layer.line && layer.line.startsWith("thought:"), `激活 query 应注入 thought，实际 ${JSON.stringify(layer)}`);
+  assert.equal(layer.count, 2, "P2-3：count=实际选中条数（R7 灰度：两条 σ 相关 thought 均激活 → 升 2；预算闸门由 buildSoulText 裁决）");
+  assert.ok(layer.line.includes("σ振荡"), `应注入最激活的 thought（σ振荡），实际 ${layer.line}`);
+  assert.ok(!layer.line.includes("琐事"), "无关 thought 不应注入");
   // R7 灰度升 2：预算余量时最多 2 条（默认 1 条由 buildSoulText 预算闸门裁决）
   const two = buildThoughtLayer("sigma_norm 缓漂 退活 趋势 反弹 断崖 新尺度", thoughts, cfg, 2);
-  assert.ok(two && two.includes("｜"), `maxItems=2 应可出 2 条（｜ 分隔），实际 ${two}`);
+  assert.ok(two && two.line.includes("｜"), `maxItems=2 应可出 2 条（｜ 分隔），实际 ${JSON.stringify(two)}`);
+  assert.equal(two.count, 2, "P2-3：2 条时 count=2");
   // 验收锚 3.02：thought 可见 ≥1 次/轮（激活 query 必有 1 条）
-  assert.ok(line.split("｜").length >= 1, "thought 可见 ≥1 次/轮（3.02 锚）");
+  assert.ok(layer.line.split("｜").length >= 1, "thought 可见 ≥1 次/轮（3.02 锚）");
 });
 
 ok("P1-1 thought 预算闸门：2 条使回魂段超限 → 降 1 条（C1 观测点）", () => {
@@ -439,8 +627,21 @@ await okAsync("P1-1 集成：真实链路六层齐 + 总注入 ≤800 + 景观 �
   assert.ok(text.includes("[回魂]"), "①回魂段");
   const landIdx = text.indexOf("景观:");
   assert.ok(landIdx !== -1, "②景观叙事");
-  const landEnd = text.indexOf(" / ", landIdx);
-  const landLen = landEnd !== -1 ? landEnd - landIdx : text.length - landIdx;
+  // P2-5（审计 2026-08-16）：旧断言 `indexOf(" / ", landIdx)` 在弥散态探测段内部
+  // （bits 以 " / " 连接）提前截断 → landLen≈22 恒过（假阳性）。修正：只认**顶层**
+  // [回魂] part 分隔符——" / " 后跟 thought:/最近: 的才是段分隔；探测段内部
+  // " / " 后跟读数位（数字/σmax…）不匹配；搜索边界 = [记忆注入] 块前（soul 段内）。
+  const soulEndIdx = text.indexOf("\n\n[记忆注入]", landIdx);
+  const searchEnd = soulEndIdx !== -1 ? soulEndIdx : text.length;
+  let landEnd = -1;
+  for (let i = landIdx; i < searchEnd && i !== -1; i = text.indexOf(" / ", i + 1)) {
+    const after = text.slice(i + 3, Math.min(searchEnd, i + 3 + 12)).trimStart();
+    if (after.startsWith("thought:") || after.startsWith("最近:") || after === "") {
+      landEnd = i;
+      break;
+    }
+  }
+  const landLen = (landEnd !== -1 ? landEnd : searchEnd) - landIdx;
   assert.ok(landLen <= 200, `②景观 ≤200 字（实际 ${landLen}）`);
   assert.ok(text.includes("thought:"), "③thought 可见（3.02 锚 ≥1 次/轮）");
   assert.ok(text.includes("[记忆注入]"), "④焦点记忆");
