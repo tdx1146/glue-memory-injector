@@ -349,9 +349,11 @@ export function resolveConfig(pluginConfig) {
     // 在线多采样（SelfCheckGPT 工程同构）开关，默认开；关闭则 consistency
     // 全走静态默认（fail-open 兼容路径）。
     lmsRecallConsistencyEnabled: cfg.lmsRecallConsistencyEnabled !== false,
-    // P1-3（阶段 2 步骤 4）：verifyChainEnabled——注入时验证链开关，默认开；
-    // 关闭则高 stakes 判定与验证链整体不跑（零 HTTP、零日志、注入面零改动）。
-    verifyChainEnabled: cfg.verifyChainEnabled !== false,
+    // P1-3（阶段 2 步骤 4）：verifyChainEnabled——注入时验证链开关。
+    // P0 止血（2026-08-16 21:40）：假冲突污染主会话（2 条真实记忆被标 labile），
+    // P1 修复（overlapMatch 子串碰撞/hRepro&&eRepro 不辨矛盾/幂等竞态）前默认关闭；
+    // 恢复：cfg.verifyChainEnabled !== false（经插件配置开启）或 P1 修复后改回。
+    verifyChainEnabled: cfg.verifyChainEnabled === true,
     thoughtActivationMin: Number.isFinite(cfg.thoughtActivationMin)
       ? Math.max(0, Math.min(1, cfg.thoughtActivationMin))
       : 0.05,
