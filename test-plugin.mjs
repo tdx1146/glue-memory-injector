@@ -38,6 +38,11 @@ const {
   detectHighStakes,
   fetchLmsVerify,
   runVerifyChain,
+  isContradictionPair,
+  stripVerifyMetadata,
+  writeDoubtConflict,
+  verifyIngested,
+  resolveConfig,
   resolveScoreParams,
   normalizeEntryKey,
   trustDistributionStats,
@@ -712,6 +717,7 @@ await okAsync("P1-3 验证链：冲突场景 → 独立验证确认 → [doubt] 
       glueUrl: `http://127.0.0.1:${port}`,
       lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
       landscapeSid: "main",
+      verifyChainEnabled: true, // P0 止血后默认关（a8fe757）；本测试显式开启验证链
       minIntervalMs: 0,
       maxChars: 800,
     });
@@ -730,7 +736,8 @@ await okAsync("P1-3 验证链：冲突场景 → 独立验证确认 → [doubt] 
     assert.ok(!lmsState.feedBodies[0].text.includes("⚠️"), "写侧内容不得含读时注解（防证伪落空）");
     assert.equal(lmsState.feedBodies[0].sender, "p1-3-verify", "sender 应标记验证链来源");
     // 独立验证 = 2 次 LMS /recall（V1/H + V2/E）+ P1-2 窄路径 1 次（E 低信任）
-    assert.equal(lmsState.recallHits, 3, `验证 2 + 窄路径 1 = 3 次 LMS /recall，实际 ${lmsState.recallHits}`);
+    // + P1 修复（根因 3）写前查重 1 次（verifyIngested）
+    assert.equal(lmsState.recallHits, 4, `验证 2 + 窄路径 1 + 写前查重 1 = 4 次 LMS /recall，实际 ${lmsState.recallHits}`);
     // provenance：VERIFY-* 日志含（输入/验证源/结果/时间戳）
     await new Promise((r) => setTimeout(r, 150)); // 等 fire-and-forget 的 WRITE 日志落盘
     const logs = readVerifyLogs("生日P13");
@@ -782,6 +789,7 @@ await okAsync("P1-3 验证链：独立验证未确认（H 不可复现）→ 不
       glueUrl: `http://127.0.0.1:${port}`,
       lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
       landscapeSid: "main",
+      verifyChainEnabled: true, // P0 止血后默认关（a8fe757）；本测试显式开启验证链
       minIntervalMs: 0,
       maxChars: 800,
     });
@@ -836,6 +844,7 @@ await okAsync("P1-3 零开销契约：无冲突 → 零验证 HTTP、零日志�
       glueUrl: `http://127.0.0.1:${port}`,
       lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
       landscapeSid: "main",
+      verifyChainEnabled: true, // P0 止血后默认关（a8fe757）；本测试显式开启以验证零开销契约
       minIntervalMs: 0,
       maxChars: 800,
     });
@@ -895,6 +904,7 @@ await okAsync("P1-3 敏感话题：STAKE_TOPICS 白名单 → 验证候选可复
       glueUrl: `http://127.0.0.1:${port}`,
       lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
       landscapeSid: "main",
+      verifyChainEnabled: true, // P0 止血后默认关（a8fe757）；本测试显式开启验证链
       minIntervalMs: 0,
       maxChars: 800,
     });
@@ -912,6 +922,261 @@ await okAsync("P1-3 敏感话题：STAKE_TOPICS 白名单 → 验证候选可复
     lmsServer.close();
     if (prev === undefined) delete process.env.STAKE_TOPICS;
     else process.env.STAKE_TOPICS = prev;
+  }
+});
+
+// ---- P1-3 修复（审计 2026-08-16 三根因，四妹 §二；灵魂指标四条）----
+
+ok("P1-3fix 根因1（灵魂指标①）：时间戳/元数据子串不再触发冲突（元数据排除）", () => {
+  // 审计实弹案例（12:53:10）：共享片段 "[2026-08-06 00:" 纯为时间戳元数据
+  assert.equal(
+    overlapMatch("[Thu 2026-08-06 00:11 GMT+8] 开工吧", "System: [2026-08-06 00:23 GMT+8] Gate"),
+    false,
+    "纯时间戳共享 → 不冲突",
+  );
+  // 日期-only 共享（同一日期两个不同事件）→ 不冲突
+  assert.equal(overlapMatch("2026-08-06 开会讨论了总线", "2026-08-06 是姐姐的生日"), false, "纯日期元数据共享 → 不冲突");
+  // 时钟-only 共享 → 不冲突
+  assert.equal(overlapMatch("00:23 开工了", "00:23 收工了"), false, "纯时钟元数据共享 → 不冲突");
+  // detectHighStakes 层：时间戳碰撞对不产生 stake
+  const results = [
+    { id: "a", text: "[Thu 2026-08-06 00:11 GMT+8] 开工吧" },
+    { id: "b", text: "System: [2026-08-06 00:23:49 GMT+8] Gate" },
+  ];
+  assert.equal(detectHighStakes(results, {}).length, 0, "时间戳碰撞 → 无 stake");
+  // 元数据排除不误伤真实冲突（同前缀不同值仍命中）
+  assert.equal(overlapMatch("用户生日是8月30日", "用户生日是8月15日"), true, "真实冲突对不受元数据排除影响");
+  // 元数据排除后真实共享片段仍命中
+  assert.equal(
+    overlapMatch("[Thu 2026-08-06 00:11 GMT+8] 讨论了总线方案", "[2026-08-06 00:23:49 GMT+8] 讨论了总线方案"),
+    true,
+    "剥离时间戳后真实内容共享仍命中",
+  );
+  // stripVerifyMetadata 结构化字段直接剔除（不做子串匹配）
+  assert.equal(stripVerifyMetadata("[Thu 2026-08-06 00:11 GMT+8] 开工吧"), "开工吧");
+  assert.equal(stripVerifyMetadata("System: [2026-08-06 00:23:49 GMT+8] Gate"), "Gate");
+});
+
+ok("P1-3fix 根因2（灵魂指标②）：语义互补条目不判冲突（双方存在 ≠ 矛盾）", () => {
+  // 审计 P0 实弹对：同为负向陈述，语义互补而非矛盾
+  assert.equal(isContradictionPair("你们都完全跑偏了", "批评我两天没有自主行动"), false, "无共享片段 → 不判冲突");
+  // 共享片段存在但语义互补（同主题同极性 + 双侧同否定）→ 不判冲突
+  assert.equal(
+    isContradictionPair("批评我两天没有自主行动", "批评我两天没有行动力"),
+    false,
+    "共享片段但同极性相似陈述 → 不判冲突",
+  );
+  // 同向正面陈述（不错 vs 很棒——不 是 错 的内部否定，非翻转）→ 不判冲突
+  assert.equal(isContradictionPair("这次的方案很棒", "这次的方案很不错"), false, "同向正面 → 不判冲突");
+  // 同义否定不同词（没有 vs 无）→ 同态，不判翻转
+  assert.equal(isContradictionPair("批评我两天没有自主行动", "批评我两天无自主行动"), false, "同义否定 → 不判冲突");
+  // detectHighStakes 层：互补对无共享片段 → 零 stake（零开销契约保持）
+  assert.equal(
+    detectHighStakes([
+      { id: "a", text: "你们都完全跑偏了" },
+      { id: "b", text: "批评我两天没有自主行动" },
+    ], {}).length,
+    0,
+    "互补对 → 无 stake",
+  );
+});
+
+ok("P1-3fix 根因2（灵魂指标③）：真矛盾条目仍触发（方向相反/数值冲突/否定翻转）", () => {
+  // 数值差异超阈值：同前缀不同取值
+  assert.equal(isContradictionPair("用户生日是8月30日", "用户生日是8月15日"), true, "日期取值不同 → 冲突");
+  assert.equal(isContradictionPair("今天走了3公里", "今天走了30公里"), true, "数值差异 → 冲突");
+  // 否定词极性翻转
+  assert.equal(isContradictionPair("用户喜欢下雨天", "用户不喜欢下雨天"), true, "否定翻转 → 冲突");
+  assert.equal(isContradictionPair("批评我两天没有自主行动", "批评我两天有自主行动"), true, "没有/有 翻转 → 冲突");
+  assert.equal(isContradictionPair("我支持这个方案", "我不支持这个方案"), true, "支持/不支持 翻转 → 冲突");
+  // 方向性相反（正/负极性）
+  assert.equal(isContradictionPair("这次的方案很棒", "这次的方案很糟糕"), true, "正负极性相反 → 冲突");
+  assert.equal(isContradictionPair("今天的方案很好", "今天的方案不好"), true, "好/不好 极性相反 → 冲突");
+  // 失败路径：非字符串 → false（fail-open）
+  assert.equal(isContradictionPair(null, "x"), false);
+  assert.equal(isContradictionPair("x", undefined), false);
+  // 根因1+2 联动：元数据排除后真实冲突对在 detectHighStakes 层仍触发
+  const results = [
+    { id: "e", text: "[Thu 2026-08-06 00:11 GMT+8] 用户生日是8月30日 ⚠️置信0.2" },
+    { id: "h", text: "[2026-08-06 00:23:49 GMT+8] 用户生日是8月15日" },
+  ];
+  assert.equal(detectHighStakes(results, {}).length, 1, "时间戳剥离后真实取值冲突仍产生 stake");
+});
+
+ok("P1-3fix 默认关：verifyChainEnabled 默认 false（P0 止血 a8fe757 + P1 修复后保持，四妹重审通过才开）", () => {
+  assert.equal(resolveConfig({}).verifyChainEnabled, false, "无配置 → 默认关");
+  assert.equal(resolveConfig({ verifyChainEnabled: true }).verifyChainEnabled, true, "显式 true → 开");
+});
+
+await okAsync("P1-3fix 根因3（灵魂指标④）：客户端超时但服务端已摄入 → 查重后不重复登记（rebuttal 不放大）", async () => {
+  let feedCalls = 0;
+  let ingested = false;
+  const lmsServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "POST" && req.url.startsWith("/recall")) {
+        const q = JSON.parse(body).query || "";
+        res.writeHead(200, { "Content-Type": "application/json" });
+        // 查重：已摄入 → 返回 [doubt] conflict 事件（内容与 key 共享片段）
+        const out = ingested && q.includes("冲突幂等P17")
+          ? [{ text: "[doubt] conflict: 冲突幂等P17条目", consistency: 1.0, adaptive_confidence: 1.0, doubt_verdict: false }]
+          : [];
+        res.end(JSON.stringify({ results: out }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/feed")) {
+        feedCalls += 1;
+        ingested = true; // 服务端已摄入（客户端响应超时 → 结果未知）
+        // 不响应：客户端 AbortController 超时（150ms）后 socket 关闭
+        return;
+      }
+      res.writeHead(404);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => lmsServer.listen(0, "127.0.0.1", r));
+  const cfg = {
+    lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
+    landscapeSid: "main",
+    verifyTimeoutMs: 150, // 加速超时模拟（不等真实 4s）
+  };
+  try {
+    // 第一次尝试：/feed 超时（服务端已摄入，客户端不知情）
+    const r1 = await writeDoubtConflict(cfg, "冲突幂等P17条目");
+    assert.equal(r1.written, false, "超时 → 未确认写入");
+    assert.ok(r1.reason.includes("timeout"), `应识别为超时（未知结果），实际 ${r1.reason}`);
+    assert.equal(feedCalls, 1, "第一次尝试发出 1 次 /feed");
+    // 第二次尝试：窗口内 pending → 先查重 → 已摄入 → 不重复写（灵魂指标④）
+    const r2 = await writeDoubtConflict(cfg, "冲突幂等P17条目");
+    assert.equal(r2.written, false, "查重确认已摄入 → 不重复写");
+    assert.equal(r2.reason, "dedup-ingested", `应 dedup-ingested，实际 ${r2.reason}`);
+    assert.equal(feedCalls, 1, "第二次尝试零 /feed（查重拦截 → rebuttal 不放大）");
+    // 第三次尝试：done 永久幂等（无查重也拦截）
+    const r3 = await writeDoubtConflict(cfg, "冲突幂等P17条目");
+    assert.equal(r3.reason, "dedup-done", `done 永久幂等，实际 ${r3.reason}`);
+    assert.equal(feedCalls, 1, "第三次尝试零 /feed");
+  } finally {
+    lmsServer.close();
+  }
+});
+
+await okAsync("P1-3fix 根因2（全链）：hRepro&&eRepro 命中但语义互补 → 不登记冲突（零 /feed、不标注）", async () => {
+  const lmsState = { recallHits: 0, feedHits: 0 };
+  const lmsServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/landscape/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ session_id: "main", landscape: { num_nodes: 2, activation: { entropy_norm: 0.5, active_nodes: 2, top_activated: [{ node: 1, sigma: 0.6 }, { node: 2, sigma: 0.4 }] } } }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/recall")) {
+        lmsState.recallHits += 1;
+        const q = JSON.parse(body).query || "";
+        res.writeHead(200, { "Content-Type": "application/json" });
+        // V1（H 复现，行动力）→ 高一致未怀疑；V2（E 复现，自主行动）→ 可复现
+        const out = q.includes("行动力")
+          ? [{ text: "批评我两天P18B没有行动力", consistency: 0.9, adaptive_confidence: 0.9, doubt_verdict: false }]
+          : q.includes("自主行动")
+            ? [{ text: "批评我两天P18A没有自主行动", consistency: 0.8, adaptive_confidence: 0.8, doubt_verdict: false }]
+            : [];
+        res.end(JSON.stringify({ results: out }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/feed")) {
+        lmsState.feedHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => lmsServer.listen(0, "127.0.0.1", r));
+  const { server, port } = await startMockGlue([
+    { id: "e", text: "批评我两天P18A没有自主行动 ⚠️置信0.2", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+    { id: "h", text: "批评我两天P18B没有行动力", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+  ], { soul: null });
+  try {
+    _resetRateLimitForTest();
+    const text = await buildMemoryContext("测试互补P18冲突", {
+      glueUrl: `http://127.0.0.1:${port}`,
+      lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
+      landscapeSid: "main",
+      verifyChainEnabled: true, // 显式开启验证链（默认关）
+      minIntervalMs: 0,
+      maxChars: 800,
+    });
+    assert.ok(text && text.includes("[记忆注入]"), "应注入");
+    assert.ok(!text.includes("[doubt] conflict"), `互补对 → 注入面不标注，实际 ${text}`);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(lmsState.feedHits, 0, "互补对 → 零 /feed（矛盾判定拦截虚假 labile 登记）");
+    // 窄路径 1（E 低信任）+ V1 + V2 = 3；未确认 → 无查重
+    assert.equal(lmsState.recallHits, 3, `窄路径 1 + 验证 2 = 3 次 LMS /recall，实际 ${lmsState.recallHits}`);
+    const logs = readVerifyLogs("P18");
+    assert.ok(
+      logs.some((l) => l.includes("VERIFY-RESULT") && l.includes("verdict=not-confirmed") && l.includes("contradiction=false")),
+      `应有 VERIFY-RESULT not-confirmed contradiction=false，实际 ${logs.join("\n")}`,
+    );
+  } finally {
+    server.close();
+    lmsServer.close();
+  }
+});
+
+await okAsync("P1-3fix 默认关（行为层）：无 verifyChainEnabled 配置 → 验证链零活动（P1-2 窄路径不受影响）", async () => {
+  const lmsState = { recallHits: 0, feedHits: 0 };
+  const lmsServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/landscape/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ session_id: "main", landscape: { num_nodes: 2, activation: { entropy_norm: 0.5, active_nodes: 2, top_activated: [{ node: 1, sigma: 0.6 }, { node: 2, sigma: 0.4 }] } } }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/recall")) {
+        lmsState.recallHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ results: [] }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/feed")) {
+        lmsState.feedHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => lmsServer.listen(0, "127.0.0.1", r));
+  const { server, port } = await startMockGlue([
+    { id: "e", text: "用户生日P19A是8月30日 ⚠️置信0.2", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+    { id: "h", text: "用户生日P19B是8月15日", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+  ], { soul: null });
+  try {
+    _resetRateLimitForTest();
+    const text = await buildMemoryContext("测试默认关P19冲突", {
+      glueUrl: `http://127.0.0.1:${port}`,
+      lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
+      landscapeSid: "main",
+      minIntervalMs: 0,
+      maxChars: 800,
+      // 注意：无 verifyChainEnabled → 默认关（a8fe757 + P1 修复后保持）
+    });
+    assert.ok(text && text.includes("[记忆注入]"), "应注入");
+    assert.ok(!text.includes("[doubt] conflict"), `默认关 → 不标注，实际 ${text}`);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(lmsState.feedHits, 0, "默认关 → 零 /feed");
+    assert.equal(lmsState.recallHits, 1, `默认关 → 仅 P1-2 窄路径 1 次 /recall（无 V1/V2/查重），实际 ${lmsState.recallHits}`);
+  } finally {
+    server.close();
+    lmsServer.close();
   }
 });
 

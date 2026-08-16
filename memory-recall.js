@@ -17,12 +17,15 @@
 //     （阶段 4 已实现：激活 thought 的行动意向四问 + 分级；只展示不执行）
 //   注入块 ≤800 字硬约束。
 //
-// 阶段 2 步骤 4（P1-3 注入时验证链，2026-08-16，定稿 v2 §六）：
+// 阶段 2 步骤 4（P1-3 注入时验证链，2026-08-16，定稿 v2 §六；P1 三根因修复
+// 2026-08-16 审计后，验证链默认关闭（verifyChainEnabled===true 才启用））：
 //   高 stakes 可操作化（冲突检测 + STAKE_TOPICS 白名单）→ CoVe 轻量验证链
 //   （草稿→独立验证→修正；独立验证防伪独立：端点/query/批次三方不同源）→
-//   确认写 [doubt] conflict → /feed → doubt_ingest conflict 事件 → mark_labile
-//   （Nader 2000 再巩固入口）；VERIFY-* 日志 provenance 防回声。零开销：
-//   无高 stakes 不触发（无 HTTP、无日志、注入面零改动）。
+//   确认（hRepro&&eRepro + isContradictionPair 矛盾判定）写 [doubt] conflict
+//   → /feed → doubt_ingest conflict 事件 → mark_labile（Nader 2000 再巩固
+//   入口）；VERIFY-* 日志 provenance 防回声。零开销：无高 stakes 不触发
+//   （无 HTTP、无日志、注入面零改动）。P1 修复：元数据排除 + 矛盾判定 +
+//   幂等查重（详见步骤 4 段注释）。
 //
 // 阶段 2 步骤 2（P1-1 完整落地，2026-08-16，定稿 v2 §四）：
 //   ②景观叙事主缺口修复：直调 LMS GET /landscape/{sid}（端点已存在，只读
@@ -125,11 +128,28 @@ const CONSISTENCY_FETCH_TIMEOUT_MS = 4000;    // 窄路径 /recall 快路径（�
 // 垃圾过滤哲学），不进候选也不作高信任参照（防回声防线 1）。
 // 验证链（CoVe 轻量：草稿→独立验证→修正）与 provenance 防回声详见
 // runVerifyChain 段注释（本处仅常量）。参数先落盘（VERIFY-PARAMS 日志）。
-const VERIFY_TIMEOUT_MS = 4000;         // 验证检索/写事件快路径（同 /landscape 哲学）
+// P1 修复（审计 2026-08-16 三根因）：验证检索/写超时参数化（同 DIFFUSE_ENTROPY_RATIO
+// 模式：env 可覆盖，默认 4000——测试无需等 4s 即可模拟写超时竞态）。
+const VERIFY_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.VERIFY_TIMEOUT_MS ?? "");
+  return Number.isFinite(raw) && raw > 0 ? raw : 4000;
+})();
 const VERIFY_K_DEFAULT = 5;             // 验证批次 k（小批量，够判定可复现性）
 const VERIFY_MAX_CHAINS = 2;            // 每轮验证链条数上限（预算纪律，防风暴）
 const VERIFY_OVERLAP_MIN = 5;           // 共享片段最小长度（防 2-3 字高频词伪冲突）
 const VERIFY_WRITE_DEDUP_MS = 60000;    // 写侧幂等窗口（同 /store 60s 去重哲学）
+// P1-3 修复（根因 3）：幂等窗口内写尝试上限——半死服务（/feed 挂但 /recall 活）
+// 时窗口滑动重试被封顶，防旧版 14 次重写式放大（每窗口 ≤2 次，且均先查重）。
+const VERIFY_MAX_WRITE_ATTEMPTS = 2;
+// P1-3 修复（根因 2）：数值矛盾判定阈值（0 = 共享上下文内数值集合任何差异即矛盾；
+// 参数化预留——后续如发现日期抖动类误报可上调，无需改码）。
+const VERIFY_NUM_DIFF_THRESHOLD = (() => {
+  const raw = Number(process.env.VERIFY_NUM_DIFF_THRESHOLD ?? "");
+  return Number.isFinite(raw) && raw >= 0 ? raw : 0;
+})();
+// P1-3 修复（根因 2）：否定词极性翻转判定窗口 = 共享片段边界 ±3 字（只认紧贴片段
+// 的否定，远处否定不算——防“双方存在”类伪矛盾，见 isContradictionPair 注释）。
+const VERIFY_NEGATION_NEAR_CHARS = 3;
 const HIGH_TRUST_MIN = 0.5;             // 高信任判定：无 ⚠️标注（默认 1.0）或标注 ≥0.5
 const VERIFY_DOUBT_PREFIX_RE = /^\s*\[doubt\]/i; // 防回声：系统事件非验证候选
 
@@ -377,6 +397,8 @@ export function _resetRateLimitForTest() {
 // computeFocusScore/applyLowTrustPolicy/fetchLmsRecallConsistency）。
 // 阶段 2 P1-3（2026-08-16）：overlapMatch/detectHighStakes/fetchLmsVerify/
 // runVerifyChain 均随函数声明 export（纯函数 + 无副作用 HTTP 封装）。
+// P1 修复（审计 2026-08-16 三根因）：stripVerifyMetadata/isContradictionPair/
+// verifyIngested/writeDoubtConflict 亦随函数声明 export（供单测直测根因语义）。
 export { parseConfidenceTag, buildDoubtLayer, buildDiffuseProbe, buildLandscapeNarrative };
 
 // 仅供测试：读取限流状态
@@ -1341,30 +1363,90 @@ function logScoreDoubt(mode, trust, before, after, annotated, snippet) {
 //   防线 1：detectHighStakes 排除 [doubt] 前缀条目（系统事件非候选、非参照）
 //   ——验证链自身产物（[doubt] conflict 事件）不会被当作新事实再验证
 //   防线 2：VERIFY-* 日志含（输入/验证源/结果/时间戳）——产物可追溯
-//   防线 3：写侧 60s 幂等窗口（VERIFY_WRITE_DEDUP_MS，成功才记窗口）
+//   防线 3：写侧幂等（P1 修复根因 3：乐观窗口 + 写前查重 + done 永久幂等，
+//     见 writeDoubtConflict 注释——旧“成功才记窗口”已被 60s 竞态实弹证伪）
+//
+// P1 修复（2026-08-16 审计三根因，四妹 §二，步骤 4 重审前置）：
+//   根因 1（overlapMatch 纯子串碰撞）：stripVerifyMetadata 排除时间戳/日期/
+//     System 前缀等元数据（结构化字段直接剔除，不做子串匹配）——实弹案例
+//     "[Thu 2026-08-06 00:11 GMT+8] 开工吧" vs "System: [...] Gate" 不再触发。
+//     方案：共享片段(≥5字保留)+排除元数据+否定词极性判定组合（插件无
+//     embedding 通道——嵌入需 HTTP+跨机 Ollama 依赖，破坏零开销契约）。
+//   根因 2（hRepro&&eRepro 只证存在不证矛盾）：命中后追加 isContradictionPair
+//     ——方向性相反/数值差异超阈值/否定词极性翻转三选一才登记冲突。
+//   根因 3（60s 幂等竞态）：乐观窗口 + verifyIngested 查重（/recall 只读）+ 
+//     done 永久幂等 + attempts 封顶——超时后先查重再判“未写入”。
+//   验证链默认关闭（verifyChainEnabled 默认 false，P0 止血 + P1 修复后保持，
+//     四妹重审通过才开）。
 //
 // 零开销契约：无高 stakes → 零 HTTP、零日志、注入面零改动（纯函数判定）。
 
+// ── P1-3 修复（根因 1，审计 2026-08-16）：overlapMatch 元数据排除 ──
+// 实弹案例（审计 12:53:10）："[Thu 2026-08-06 00:11 GMT+8] 开工吧" vs
+// "System: [2026-08-06 00:23:49 GMT+8] Gate"——共享片段 "[2026-08-06 00:"
+// 纯为时间戳元数据，零语义冲突仍被 confirmed。修复：子串比对前剥离元数据
+// （时间戳/日期/时钟/System 前缀等结构化字段——直接剔除，不做子串匹配），
+// 结构化字段不再参与共享片段判定。方案选择（四妹 §二-1 许可分支）：插件无
+// embedding 通道（thought 激活度是 bigram 关键词法；LMS embedding 在服务端
+// 且依赖跨机 Ollama bge-m3，热路径不可依赖）→ 用“共享片段 + 排除元数据 +
+// 否定词极性判定组合”，不加 HTTP/不新增依赖（embedding 方案会破坏零开销
+// 契约——无 stakes 也要网络调用，与既有“热路径不加 embed”设计冲突）。
+
+/** 剥离验证比对用的元数据字段（时间戳/日期/时钟/System 前缀/星期标记等）。
+ * 只剥结构化字段：①方括号内含日期/时钟的时间戳块（[Thu 2026-08-06 …]）
+ * ②裸 ISO 日期时间 ③时钟（时:分[:秒]）④System:/[System] 前缀 ⑤GMT/UTC 偏移
+ * ⑥英文星期标记。非时间戳方括号内容（[doubt]/[行动]/[生成约束]）保留——
+ * 那些是内容标记不是元数据。纯函数、幂等、零依赖。 */
+export function stripVerifyMetadata(text) {
+  if (typeof text !== "string" || !text) return "";
+  let out = text;
+  // 方括号时间戳块（内含日期或时钟）：[Thu 2026-08-06 00:11 GMT+8]
+  out = out.replace(/\[[^\]]*\d{4}-\d{2}-\d{2}[^\]]*\]/g, " ");
+  out = out.replace(/\[[^\]]*\d{1,2}:\d{2}(?::\d{2})?[^\]]*\]/g, " ");
+  // 裸 ISO 日期时间 / 时钟 / GMT-UTC 偏移 / 英文星期
+  out = out.replace(/\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?/g, " ");
+  out = out.replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, " ");
+  out = out.replace(/\b(?:GMT|UTC)[+-]?\d*\b/gi, " ");
+  out = out.replace(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b/gi, " ");
+  // System 前缀（openclaw 系统消息标记）
+  out = out.replace(/^\s*(?:System|系统)\s*[:：]\s*/g, " ");
+  out = out.replace(/\[System\]/gi, " ");
+  return out.replace(/\s+/g, " ").trim();
+}
+
+/** 找共享片段（元数据排除后）：返回 {frag, posA, posB}（pos 为各自元数据排除
+ * 后文本中的位置）或 null。滑动窗扫描（与原 overlapMatch 同法）——找的是
+ * 连续公共子串，不是子序列；minLen=5 防 2-3 字高频词伪冲突。 */
+function findSharedFragment(a, b, minLen) {
+  if (typeof a !== "string" || typeof b !== "string") return null;
+  const na = normalizeEntryKey(stripVerifyMetadata(a));
+  const nb = normalizeEntryKey(stripVerifyMetadata(b));
+  if (!na || !nb) return null;
+  const short = na.length <= nb.length ? na : nb;
+  const long = short === na ? nb : na;
+  const shortIsA = short === na;
+  if (short.length < minLen) return null;
+  for (let i = 0; i <= short.length - minLen; i += 1) {
+    const frag = short.slice(i, i + minLen);
+    const j = long.indexOf(frag);
+    if (j !== -1) {
+      return { frag, posA: shortIsA ? i : j, posB: shortIsA ? j : i };
+    }
+  }
+  return null;
+}
+
 /** 共享片段匹配（_find_overlapping_entry 工程匹配的扩展，无 LLM）：
- * 归一化（剥 ⚠️置信 标注 + 折叠空白）后，任一方存在 ≥minLen 的连续片段
- * 出现在另一方 → true。原函数是纯包含（needle ∈ text 或 text[:120] ∈
- * needle），用于证伪时找重叠条目（content 是条目文本摘要，天然包含）；
- * 用于注入冲突检测会漏掉"前缀相同、取值相反"的真实冲突对（如
- * "生日是8月30日" vs "生日是8月15日"），故扩展为共享片段。
+ * 归一化（剥 ⚠️置信 标注 + 折叠空白）+ 元数据排除（stripVerifyMetadata——
+ * P1 修复根因 1：时间戳/日期/System 前缀等结构化字段直接剔除，不做子串匹配）
+ * 后，任一方存在 ≥minLen 的连续片段出现在另一方 → true。原函数是纯包含
+ * （needle ∈ text 或 text[:120] ∈ needle），用于证伪时找重叠条目（content 是
+ * 条目文本摘要，天然包含）；用于注入冲突检测会漏掉"前缀相同、取值相反"的
+ * 真实冲突对（如"生日是8月30日" vs "生日是8月15日"），故扩展为共享片段。
  * minLen=VERIFY_OVERLAP_MIN(5)：中文 5 字 ≈ 语义短语；防 2-3 字高频词
  * （"用户""生日"）伪冲突。 */
 export function overlapMatch(a, b, minLen = VERIFY_OVERLAP_MIN) {
-  if (typeof a !== "string" || typeof b !== "string") return false;
-  const na = normalizeEntryKey(a);
-  const nb = normalizeEntryKey(b);
-  if (!na || !nb) return false;
-  const short = na.length <= nb.length ? na : nb;
-  const long = short === na ? nb : na;
-  if (short.length < minLen) return false;
-  for (let i = 0; i <= short.length - minLen; i += 1) {
-    if (long.includes(short.slice(i, i + minLen))) return true;
-  }
-  return false;
+  return findSharedFragment(a, b, minLen) !== null;
 }
 
 /** 高 stakes 判定（纯函数，R6 可操作化，定稿 v2 §六-1）。
@@ -1419,14 +1501,162 @@ export function detectHighStakes(results, env) {
   return out;
 }
 
+// ── P1-3 修复（根因 2，审计 2026-08-16）：hRepro&&eRepro 追加矛盾判定 ──
+// 旧确认判据 confirmed = hRepro && eRepro 只证明“双方都存在于记忆”，不证明
+// “二者矛盾”（短条目按自身文本检索必然自复现 → 假确认；实弹 12:52:56
+// “跑偏了” vs “批评我两天”对即此）。修复：命中（hRepro&&eRepro）后必须追加
+// 矛盾判定——三选一成立才登记冲突：
+//   ①方向性相反（正/负极性）：netPolarity 一正一负（否定词翻转极性字）
+//   ②数值差异超阈值：共享片段上下文窗（±20 字）内数值集合存在差异
+//      （“生日8月30日” vs “生日8月15日” → 30≠15；阈值参数化，默认 0）
+//   ③否定词极性翻转：共享片段边界 ±3 字内一侧有否定词另一侧没有
+//      （“喜欢下雨” vs “不喜欢下雨”；“没有自主行动” vs “有自主行动”）
+// “双方存在”只是前提不是结论。语义互补对（同为负向陈述，如“跑偏了” vs
+// “批评我两天没有自主行动”）三规则全不命中 → 不判冲突（灵魂指标②）。
+// 全部纯函数、零 HTTP、零依赖（无 embedding——见 stripVerifyMetadata 注释
+// 的方案选择理由）；只在 runVerifyChain 确认步调用（无 stakes 零开销）。
+
+const POLARITY_POSITIVE = new Set([
+  "喜欢", "欣赏", "爱", "优秀", "出色", "正确", "对", "支持", "同意", "成功",
+  "开心", "高兴", "满意", "乐观", "积极", "肯定", "信任", "相信", "顺利",
+  "有利", "适合", "认可", "合理", "值得", "希望", "靠谱", "完美", "漂亮",
+  "聪明", "健康", "安全", "稳定", "幸福", "欣慰", "期待", "放心", "理解",
+  "赞", "棒", "好",
+]);
+const POLARITY_NEGATIVE = new Set([
+  "讨厌", "恨", "坏", "差", "错", "错误", "反对", "不同意", "失败", "难过", "伤心",
+  "悲观", "消极", "否定", "批评", "责备", "抱怨", "怀疑", "糟糕", "不利",
+  "不适合", "否认", "不合理", "不值得", "失望", "跑偏", "离谱", "误导",
+  "危险", "恐惧", "焦虑", "担忧", "麻烦", "痛苦", "愤怒", "生气", "崩溃",
+  "混乱", "低效", "缺陷", "漏洞", "风险", "荒谬", "荒唐",
+]);
+// 否定词表（刻意不含“非/别/未/无”之外的常见误伤：非常/特别/未来/无比）。
+// 保留 无（无风险/无行动），风险点（无论/无比）需 ≥5 字共享片段+极性字邻近才
+// 可能误判，且规则①还要求两侧极性相反，误报面有界。
+const NEGATION_RE = /(?:不|没|未|无|莫|勿|休|甭|没有|不是|不能|不会|不再|从不|毫不|未曾|未必)/;
+
+/** 净极性分（启发式）：极性词计数，紧邻前 3 字内的否定词翻转该词极性。
+ * 如“不喜欢”→ 喜欢(+1) 被 不 翻转 → -1；“很不错”→ 错(-1) 被翻转 → +1。
+ * 纯启发式：不进注入面，只作矛盾判定三规则之一。 */
+function polarityScore(text) {
+  let net = 0;
+  const scan = (words, sign) => {
+    for (const w of words) {
+      let idx = text.indexOf(w);
+      while (idx !== -1) {
+        const before = text.slice(Math.max(0, idx - VERIFY_NEGATION_NEAR_CHARS), idx);
+        const negated = NEGATION_RE.test(before);
+        net += negated ? -sign : sign;
+        idx = text.indexOf(w, idx + w.length);
+      }
+    }
+  };
+  scan(POLARITY_POSITIVE, 1);
+  scan(POLARITY_NEGATIVE, -1);
+  return net;
+}
+
+/** 共享片段上下文窗内数值集合（±20 字；元数据已在 stripVerifyMetadata 剥离，
+ * “8月30日”这类内容日期数字保留）。中文数词（两天/三次）不抽取——防“批评我
+ * 两天”类互补对误判。 */
+function numbersInWindow(text, fragStart, fragLen, radius = 20) {
+  const from = Math.max(0, fragStart - radius);
+  const to = Math.min(text.length, fragStart + fragLen + radius);
+  const window = text.slice(from, to);
+  const out = [];
+  for (const m of window.matchAll(/(\d+(?:\.\d+)?)/g)) {
+    const v = parseFloat(m[1]);
+    if (Number.isFinite(v)) out.push(v);
+  }
+  return out;
+}
+
+/** 规则②：共享片段上下文窗数值差异超阈值（默认 0 = 任何差异即矛盾）。 */
+function numericConflict(na, nb, threshold) {
+  const frag = findSharedFragment(na, nb, VERIFY_OVERLAP_MIN);
+  if (!frag) return false;
+  const aNums = numbersInWindow(na, frag.posA, frag.frag.length);
+  const bNums = numbersInWindow(nb, frag.posB, frag.frag.length);
+  if (aNums.length === 0 || bNums.length === 0) return false;
+  let maxDiff = 0;
+  for (const x of aNums) {
+    for (const y of bNums) maxDiff = Math.max(maxDiff, Math.abs(x - y));
+  }
+  return maxDiff > threshold;
+}
+
+/** 规则③：共享片段边界 ±N 字内否定词状态不同（一侧有、另一侧无）→ 翻转。
+ * 只计“自由否定”（后随 2 字内不是极性词的否定）：紧贴极性词的否定（不错/
+ * 不好/不喜欢）是该极性词的内部否定——由规则①（polarityScore 否定翻转）处理，
+ * 不在此重复计（防“很棒 vs 很不错”伪翻转——两侧同为正面不判冲突）。
+ * 两侧都有自由否定（不同词也算，如“没有行动” vs “无行动”）→ 同态，不判。
+ * 否定必须紧贴片段（±3 字）——远处否定（“dandan：批评我两天没有自主行动”
+ * 对“dandan：你们都完全跑偏了”，共享片段为前缀时“没有”在远处）不算，防
+ * “双方存在”类伪矛盾。 */
+function countFreeNegations(window) {
+  let n = 0;
+  const re = new RegExp(NEGATION_RE.source, "g"); // 局部 g 标志，不动全局 NEGATION_RE
+  let m;
+  while ((m = re.exec(window)) !== null) {
+    const after = window.slice(m.index + m[0].length, m.index + m[0].length + 2);
+    const followedByPolarity = [...POLARITY_POSITIVE, ...POLARITY_NEGATIVE]
+      .some((w) => after.startsWith(w));
+    if (!followedByPolarity) n += 1;
+  }
+  return n;
+}
+
+function negationFlip(na, nb, frag) {
+  const count = (text, pos) => {
+    const before = text.slice(Math.max(0, pos - VERIFY_NEGATION_NEAR_CHARS), pos);
+    const after = text.slice(
+      pos + frag.frag.length,
+      pos + frag.frag.length + VERIFY_NEGATION_NEAR_CHARS,
+    );
+    return countFreeNegations(before) + countFreeNegations(after);
+  };
+  const ca = count(na, frag.posA);
+  const cb = count(nb, frag.posB);
+  return (ca > 0) !== (cb > 0);
+}
+
+/** 规则①：净极性相反（一正一负）。同负/同正/中性 → 不判（“跑偏了”与
+ * “批评我两天”同为负向 → 不冲突——语义互补而非矛盾，灵魂指标②）。 */
+function polarityOpposite(na, nb) {
+  const sa = polarityScore(na);
+  const sb = polarityScore(nb);
+  return (sa > 0 && sb < 0) || (sa < 0 && sb > 0);
+}
+
+/** 矛盾判定（纯函数，P1 修复根因 2）：共享片段存在的前提下三选一——
+ * ①方向性相反（正/负极性）②数值差异超阈值 ③否定词极性翻转。
+ * 任一成立 → 矛盾（true）；无共享片段 / 三规则全不命中 → false。
+ * “双方存在”（hRepro&&eRepro）只是前提，本函数才是“矛盾”的结论。 */
+export function isContradictionPair(a, b, opts = {}) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const frag = findSharedFragment(a, b, VERIFY_OVERLAP_MIN);
+  if (!frag) return false;
+  const na = normalizeEntryKey(stripVerifyMetadata(a));
+  const nb = normalizeEntryKey(stripVerifyMetadata(b));
+  const threshold = Number.isFinite(opts.numDiffThreshold)
+    ? opts.numDiffThreshold : VERIFY_NUM_DIFF_THRESHOLD;
+  if (numericConflict(na, nb, threshold)) return true;
+  if (negationFlip(na, nb, frag)) return true;
+  if (polarityOpposite(na, nb)) return true;
+  return false;
+}
+
 /** 独立验证检索（CoVe 验证步）：直调 LMS POST /recall（只读，同 P1-2
  * 窄路径端点：count_reference=False 零持久化）。
  * 返回 [{text, consistency, adaptiveConfidence, doubtVerdict}]；
  * 失败/超时/非 2xx → null（fail-open，黑盒降级 = 不确认）。 */
 export async function fetchLmsVerify(cfg, queryText) {
   const url = `${cfg.lmsUrl}/recall`;
+  // P1 修复：超时可配（cfg.verifyTimeoutMs，测试加速用；缺省走模块常量）
+  const timeoutMs = Number.isFinite(cfg && cfg.verifyTimeoutMs) && cfg.verifyTimeoutMs > 0
+    ? cfg.verifyTimeoutMs : VERIFY_TIMEOUT_MS;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const resp = await fetch(url, {
       method: "POST",
@@ -1453,7 +1683,7 @@ export async function fetchLmsVerify(cfg, queryText) {
     }));
   } catch (err) {
     const why = err && err.name === "AbortError" ? "timeout" : "network-error";
-    logMiss(`verify-${why} url=${url} timeoutMs=${VERIFY_TIMEOUT_MS}`);
+    logMiss(`verify-${why} url=${url} timeoutMs=${timeoutMs}`);
     return null;
   } finally {
     clearTimeout(timer);
@@ -1485,32 +1715,104 @@ function logVerifyParams() {
       || "(empty=conflict-only)";
     appendFileSync(
       DEBUG_LOG_FILE,
-      `[${new Date().toISOString()}] VERIFY-PARAMS max_chains=${VERIFY_MAX_CHAINS} k=${VERIFY_K_DEFAULT} timeout_ms=${VERIFY_TIMEOUT_MS} overlap_min=${VERIFY_OVERLAP_MIN} high_trust_min=${HIGH_TRUST_MIN} write_dedup_ms=${VERIFY_WRITE_DEDUP_MS} stake_topics=${JSON.stringify(topics)}\n`,
+      `[${new Date().toISOString()}] VERIFY-PARAMS max_chains=${VERIFY_MAX_CHAINS} k=${VERIFY_K_DEFAULT} timeout_ms=${VERIFY_TIMEOUT_MS} overlap_min=${VERIFY_OVERLAP_MIN} high_trust_min=${HIGH_TRUST_MIN} write_dedup_ms=${VERIFY_WRITE_DEDUP_MS} max_write_attempts=${VERIFY_MAX_WRITE_ATTEMPTS} num_diff_threshold=${VERIFY_NUM_DIFF_THRESHOLD} negation_near_chars=${VERIFY_NEGATION_NEAR_CHARS} stake_topics=${JSON.stringify(topics)}\n`,
     );
   } catch { /* 日志失败忽略 */ }
 }
 
-// 写侧 60s 幂等窗口（normalizedKey → last 成功写入 ts；防同冲突重复写回声）
+// 写侧幂等窗口（normalizedKey → {ts, state, attempts, id}）。P1-3 修复（根因 3）：
+// 旧实现“成功才记窗口”——服务端已摄入但客户端 4s 超时 → ok=false → 不记窗口 →
+// 下轮重写 → rebuttal 放大（实况 14 次重写）。修复：
+//   - 窗口按“写尝试”乐观记录（写前先记 pending，超时也不丢窗口）
+//   - state: "done"（服务端 200 确认，永久幂等——防重复登记）/ "pending"（结果未知）
+//   - pending 重试前必须查重（verifyIngested：/recall 只读确认 [doubt] conflict
+//     是否已摄入）——“客户端超时 ≠ 未写入”，先按去重键查重再判
+//   - attempts 封顶（VERIFY_MAX_WRITE_ATTEMPTS，防半死服务窗口内滑动重试）
 const verifyWriteLog = new Map();
+
+/** 冲突登记前查重（P1-3 修复根因 3）：按去重键（归一化候选文本）直调 LMS
+ * POST /recall（只读端点，零持久化）确认 [doubt] conflict 事件是否已摄入。
+ * 返回 true=已摄入（服务端已有该冲突登记，不再写）/ false=未摄入 /
+ * null=不可考（查重端点失败/超时 → 按“未知结果”处理：不重放不登记）。
+ * LMS /feed 不返回条目 id（FeedResponse 仅 status/turn_count 等，硬约束禁改
+ * LMS core）→ “按 id 查重”落地为“按去重键查重”：写入文本的归一化内容与
+ * 已入库 [doubt] 事件内容做共享片段匹配（≥5 字即同冲突）。 */
+export async function verifyIngested(cfg, key) {
+  const results = await fetchLmsVerify(cfg, String(key || "").slice(0, 300));
+  if (!Array.isArray(results)) return null; // 查重端点失败 → 未知
+  for (const r of results) {
+    const t = normalizeEntryKey(r && r.text);
+    if (!t || !VERIFY_DOUBT_PREFIX_RE.test(t)) continue; // 只认 [doubt] 系统事件
+    const content = t.replace(/^\s*\[doubt\]\s*(?:conflict|fok|lowconf|event)\s*:\s*/i, "");
+    if (content && overlapMatch(content, key)) return true;
+  }
+  return false;
+}
 
 /** 写 [doubt] conflict 事件（POST {lmsUrl}/feed，doubt_ingest conflict 事件
  * → _find_overlapping_entry → mark_labile，Nader 2000 再巩固入口）。
  * 内容 = normalizeEntryKey(候选文本)（剥 ⚠️置信 标注——集成层读时注解，
  * episodic 存储无标注；带标注写会让 _find_overlapping_entry 包含匹配
  * 失败 → 证伪落空）。截 300 字（doubt_ingest 内容上限）。
- * fire-and-forget：调用方不 await（不阻塞注入热路径）；成功才记幂等窗口
- * （失败/丢失不占窗口，下轮高 stakes 可重写）。返回 Promise<boolean>。 */
-async function writeDoubtConflict(cfg, candidateText) {
+ * fire-and-forget：调用方不 await（不阻塞注入热路径）。
+ * P1-3 修复（根因 3，幂等竞态）：
+ *   ① 写前先查重（verifyIngested）——已摄入 → 不写（防重复登记）；
+ *   ② 写前乐观记窗口（pending）——超时/失败不丢窗口，下轮先查重再判；
+ *   ③ done（200 确认）永久幂等；pending 窗口内重试封顶（attempts）；
+ *   ④ 查重不可考 → 按“未知”处理：记 pending 不写（fail-closed，宁漏不重）。
+ * 返回 {written, reason, id}：written=是否实际发出写入；reason ∈
+ * written | dedup-done | dedup-ingested | pending-inconclusive |
+ * write-failed | write-timeout | write-network-error；id=服务端确认标记
+ * （LMS /feed 无条目 id，取 turn_count/status 作 ack 标记，无可为 null）。 */
+export async function writeDoubtConflict(cfg, candidateText) {
   const key = normalizeEntryKey(candidateText);
   const now = Date.now();
-  const last = verifyWriteLog.get(key);
-  if (last !== undefined && now - last < VERIFY_WRITE_DEDUP_MS) {
-    logVerify("WRITE-DEDUP", { key, since_ms: now - last });
-    return false;
+  const entry = verifyWriteLog.get(key);
+  // 已确认写入（服务端 200）→ 永久幂等：同冲突不重复登记（防 rebuttal 放大）
+  if (entry && entry.state === "done") {
+    logVerify("WRITE-DEDUP", { key, since_ms: now - entry.ts, reason: "already-registered" });
+    return { written: false, reason: "dedup-done" };
   }
+  // 窗口内 pending（上次写入结果未知）→ 先查重再判“未写入”
+  if (entry && entry.state === "pending" && now - entry.ts < VERIFY_WRITE_DEDUP_MS) {
+    if (entry.attempts >= VERIFY_MAX_WRITE_ATTEMPTS) {
+      logVerify("WRITE-DEDUP", { key, since_ms: now - entry.ts, reason: "attempts-capped" });
+      return { written: false, reason: "dedup-pending-capped" };
+    }
+    const ingested = await verifyIngested(cfg, key);
+    if (ingested === true) {
+      verifyWriteLog.set(key, { ts: now, state: "done" });
+      logVerify("WRITE-DEDUP", { key, reason: "ingested-confirmed" });
+      return { written: false, reason: "dedup-ingested" };
+    }
+    if (ingested === null) {
+      logVerify("WRITE-DEDUP", { key, reason: "recheck-inconclusive" });
+      return { written: false, reason: "pending-inconclusive" };
+    }
+    // ingested === false：上次确实未写入 → 允许窗口内重试（attempts 封顶防放大）
+  } else {
+    // 新窗口 / 窗口过期：冲突登记前先查重（防重复登记）
+    const ingested = await verifyIngested(cfg, key);
+    if (ingested === true) {
+      verifyWriteLog.set(key, { ts: now, state: "done" });
+      logVerify("WRITE-DEDUP", { key, reason: "ingested-confirmed" });
+      return { written: false, reason: "dedup-ingested" };
+    }
+    if (ingested === null) {
+      verifyWriteLog.set(key, { ts: now, state: "pending", attempts: 1 });
+      logVerify("WRITE-PENDING", { key, reason: "recheck-inconclusive" });
+      return { written: false, reason: "pending-inconclusive" };
+    }
+  }
+  // 写尝试（乐观记窗口：写前先记 pending——超时也不丢窗口，下轮查重不重放）
+  const attempts = (entry && entry.state === "pending" ? entry.attempts : 0) + 1;
+  verifyWriteLog.set(key, { ts: now, state: "pending", attempts });
   const url = `${cfg.lmsUrl}/feed`;
+  // P1 修复：超时可配（cfg.verifyTimeoutMs，测试加速用；缺省走模块常量）
+  const timeoutMs = Number.isFinite(cfg && cfg.verifyTimeoutMs) && cfg.verifyTimeoutMs > 0
+    ? cfg.verifyTimeoutMs : VERIFY_TIMEOUT_MS;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const resp = await fetch(url, {
       method: "POST",
@@ -1525,14 +1827,22 @@ async function writeDoubtConflict(cfg, candidateText) {
     });
     if (!resp.ok) {
       logMiss(`verify-write-non-2xx status=${resp.status} url=${url}`);
-      return false;
+      return { written: false, reason: "write-failed", status: resp.status };
     }
-    verifyWriteLog.set(key, now);
-    return true;
+    // 服务端确认（200）：记录 ack 标记（FeedResponse 无条目 id，取 turn_count/status）
+    let ackId = null;
+    try {
+      const data = await resp.json();
+      if (data && typeof data.turn_count === "number") ackId = data.turn_count;
+      else if (data && typeof data.status === "string") ackId = data.status;
+    } catch { /* 响应体非 JSON 也可确认（HTTP 200 即服务端已摄入） */ }
+    verifyWriteLog.set(key, { ts: now, state: "done", id: ackId });
+    return { written: true, reason: "written", id: ackId };
   } catch (err) {
     const why = err && err.name === "AbortError" ? "timeout" : "network-error";
     logMiss(`verify-write-${why} url=${url}`);
-    return false;
+    // 超时/网络错误 = 结果未知（服务端可能已摄入）→ pending 保留 → 下轮查重
+    return { written: false, reason: `write-${why}` };
   } finally {
     clearTimeout(timer);
   }
@@ -1601,10 +1911,17 @@ export async function runVerifyChain(cfg, userQuery, results) {
       queryV2: cText,
     });
     if (s.reason === "conflict") {
-      const confirmed = hRepro && eRepro;
+      // P1 修复（根因 2）：hRepro&&eRepro 只证“双方存在”，不证“矛盾”——
+      // 命中后必须追加矛盾判定（方向性相反/数值差异超阈值/否定词极性翻转，
+      // 三选一）才登记冲突（四妹 §二-2）。“双方存在”只是前提不是结论。
+      const contradiction = s.highTrustMatch
+        ? isContradictionPair(s.candidate.text, s.highTrustMatch.text)
+        : false;
+      const confirmed = hRepro && eRepro && contradiction;
       logVerify("RESULT", {
         verdict: confirmed ? "confirmed" : "not-confirmed",
         reason: "conflict",
+        contradiction,
         candidate: s.candidate.text,
         highTrust: hText,
       });
@@ -1613,14 +1930,19 @@ export async function runVerifyChain(cfg, userQuery, results) {
           verdict: "confirmed", reason: "conflict", highTrust: hText,
         };
         // 修正：写 [doubt] conflict → /feed（fire-and-forget：不阻塞注入热
-        // 路径；结果入 VERIFY-WRITE 日志，ok=true/false 可查）
+        // 路径；结果入 VERIFY-WRITE 日志，written/reason/id 可查——P1 修复
+        // 根因 3：写前查重 + 乐观窗口，超时≠未写入）
         writeDoubtConflict(cfg, s.candidate.text)
-          .then((ok) => logVerify("WRITE", {
-            endpoint: "/feed", kind: "conflict", ok,
+          .then((res) => logVerify("WRITE", {
+            endpoint: "/feed", kind: "conflict",
+            ok: Boolean(res && res.written),
+            reason: res && res.reason,
+            id: res && res.id !== undefined && res.id !== null ? res.id : "-",
             candidate: s.candidate.text,
           }))
           .catch(() => logVerify("WRITE", {
             endpoint: "/feed", kind: "conflict", ok: false,
+            reason: "unexpected-error",
             candidate: s.candidate.text,
           }));
       }
