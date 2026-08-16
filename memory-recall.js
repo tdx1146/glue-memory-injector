@@ -17,6 +17,13 @@
 //     （阶段 4 已实现：激活 thought 的行动意向四问 + 分级；只展示不执行）
 //   注入块 ≤800 字硬约束。
 //
+// 阶段 2 步骤 4（P1-3 注入时验证链，2026-08-16，定稿 v2 §六）：
+//   高 stakes 可操作化（冲突检测 + STAKE_TOPICS 白名单）→ CoVe 轻量验证链
+//   （草稿→独立验证→修正；独立验证防伪独立：端点/query/批次三方不同源）→
+//   确认写 [doubt] conflict → /feed → doubt_ingest conflict 事件 → mark_labile
+//   （Nader 2000 再巩固入口）；VERIFY-* 日志 provenance 防回声。零开销：
+//   无高 stakes 不触发（无 HTTP、无日志、注入面零改动）。
+//
 // 阶段 2 步骤 2（P1-1 完整落地，2026-08-16，定稿 v2 §四）：
 //   ②景观叙事主缺口修复：直调 LMS GET /landscape/{sid}（端点已存在，只读
 //     fail-open）→ 读数派生叙事（主导盆地数/激活拓扑/σmax·sat/熵比/惊讶漂移），
@@ -108,6 +115,23 @@ const SCORE_DOUBT_MODE_DEFAULT = "downgrade"; // "downgrade" | "annotate"（R1 �
 const SCORE_DOWNGRADE_FACTOR = 0.3;           // 定稿 v2 §五-3：trust<0.3 → ×0.3 降权
 const CONSISTENCY_STATIC_DEFAULT = 0.5;       // 静态入库默认（中性：无抽样印证信息）
 const CONSISTENCY_FETCH_TIMEOUT_MS = 4000;    // 窄路径 /recall 快路径（同 /landscape）
+
+// ── 阶段 2 步骤 4（P1-3 注入时验证链，2026-08-16，定稿 v2 §六）────────────
+// 高 stakes 可操作化（R6）：stakes 判定 = ①注入内容与高信任记忆冲突 +
+// ②话题敏感度（env 白名单 STAKE_TOPICS，逗号分隔关键词；默认空 =
+// 全走冲突判定）。冲突检测用共享片段匹配（overlapMatch，_find_overlapping_entry
+// 工程匹配的扩展——纯包含匹配会漏掉"前缀相同、取值相反"的真实冲突对，
+// 任务书验收场景即此类）。[doubt] 前缀条目是系统事件（非对话，同 8/10
+// 垃圾过滤哲学），不进候选也不作高信任参照（防回声防线 1）。
+// 验证链（CoVe 轻量：草稿→独立验证→修正）与 provenance 防回声详见
+// runVerifyChain 段注释（本处仅常量）。参数先落盘（VERIFY-PARAMS 日志）。
+const VERIFY_TIMEOUT_MS = 4000;         // 验证检索/写事件快路径（同 /landscape 哲学）
+const VERIFY_K_DEFAULT = 5;             // 验证批次 k（小批量，够判定可复现性）
+const VERIFY_MAX_CHAINS = 2;            // 每轮验证链条数上限（预算纪律，防风暴）
+const VERIFY_OVERLAP_MIN = 5;           // 共享片段最小长度（防 2-3 字高频词伪冲突）
+const VERIFY_WRITE_DEDUP_MS = 60000;    // 写侧幂等窗口（同 /store 60s 去重哲学）
+const HIGH_TRUST_MIN = 0.5;             // 高信任判定：无 ⚠️标注（默认 1.0）或标注 ≥0.5
+const VERIFY_DOUBT_PREFIX_RE = /^\s*\[doubt\]/i; // 防回声：系统事件非验证候选
 
 // ----------------------------------------------------------------------
 // 召回L1-a（2026-08-11）：query 净化 —— 复刻 openclaw 自带 stripInboundMetadata
@@ -325,6 +349,9 @@ export function resolveConfig(pluginConfig) {
     // 在线多采样（SelfCheckGPT 工程同构）开关，默认开；关闭则 consistency
     // 全走静态默认（fail-open 兼容路径）。
     lmsRecallConsistencyEnabled: cfg.lmsRecallConsistencyEnabled !== false,
+    // P1-3（阶段 2 步骤 4）：verifyChainEnabled——注入时验证链开关，默认开；
+    // 关闭则高 stakes 判定与验证链整体不跑（零 HTTP、零日志、注入面零改动）。
+    verifyChainEnabled: cfg.verifyChainEnabled !== false,
     thoughtActivationMin: Number.isFinite(cfg.thoughtActivationMin)
       ? Math.max(0, Math.min(1, cfg.thoughtActivationMin))
       : 0.05,
@@ -346,6 +373,8 @@ export function _resetRateLimitForTest() {
 // 阶段 2 P1-2（2026-08-16）：score 公式/参数/R1 二选一/R8 核验纯函数均随函数
 // 声明 export（resolveScoreParams/normalizeEntryKey/trustDistributionStats/
 // computeFocusScore/applyLowTrustPolicy/fetchLmsRecallConsistency）。
+// 阶段 2 P1-3（2026-08-16）：overlapMatch/detectHighStakes/fetchLmsVerify/
+// runVerifyChain 均随函数声明 export（纯函数 + 无副作用 HTTP 封装）。
 export { parseConfidenceTag, buildDoubtLayer, buildDiffuseProbe, buildLandscapeNarrative };
 
 // 仅供测试：读取限流状态
@@ -1290,6 +1319,324 @@ function logScoreDoubt(mode, trust, before, after, annotated, snippet) {
   } catch { /* 日志失败忽略 */ }
 }
 
+// ── 阶段 2 步骤 4（P1-3 注入时验证链，2026-08-16，定稿 v2 §六）────────────
+// 高 stakes 可操作化（R6）→ CoVe 轻量验证链（草稿→独立验证→修正）→
+// [doubt] conflict 写 /feed → doubt_ingest conflict 事件 → mark_labile
+// （Nader 2000 再巩固入口）。
+//
+// 独立验证防伪独立（R6，代码级四条保证）：
+//   ① 端点不同：草稿批次 = glue POST /recall（cfg.glueUrl）；验证批次 =
+//      LMS POST /recall 直调（cfg.lmsUrl）
+//   ② query 不同：草稿 = 用户 query（extractQueryText 产物）；验证 = 记忆
+//      条目文本（H/E）派生——代码路径上用户 query 不进验证调用
+//   ③ 批次不同：独立 fetch 调用 = 独立采样批次；V1（H 复现）/V2（E 复现）
+//      并行互不共享结果
+//   ④ 附加独立信号：LMS recall-time consistency + doubt_verdict（conformal
+//      分位怀疑线判定，LMS 侧计算）；黑盒降级 = 多采样一致性（验证失败
+//      → 不确认，不写）
+//
+// provenance 防回声（R6）：
+//   防线 1：detectHighStakes 排除 [doubt] 前缀条目（系统事件非候选、非参照）
+//   ——验证链自身产物（[doubt] conflict 事件）不会被当作新事实再验证
+//   防线 2：VERIFY-* 日志含（输入/验证源/结果/时间戳）——产物可追溯
+//   防线 3：写侧 60s 幂等窗口（VERIFY_WRITE_DEDUP_MS，成功才记窗口）
+//
+// 零开销契约：无高 stakes → 零 HTTP、零日志、注入面零改动（纯函数判定）。
+
+/** 共享片段匹配（_find_overlapping_entry 工程匹配的扩展，无 LLM）：
+ * 归一化（剥 ⚠️置信 标注 + 折叠空白）后，任一方存在 ≥minLen 的连续片段
+ * 出现在另一方 → true。原函数是纯包含（needle ∈ text 或 text[:120] ∈
+ * needle），用于证伪时找重叠条目（content 是条目文本摘要，天然包含）；
+ * 用于注入冲突检测会漏掉"前缀相同、取值相反"的真实冲突对（如
+ * "生日是8月30日" vs "生日是8月15日"），故扩展为共享片段。
+ * minLen=VERIFY_OVERLAP_MIN(5)：中文 5 字 ≈ 语义短语；防 2-3 字高频词
+ * （"用户""生日"）伪冲突。 */
+export function overlapMatch(a, b, minLen = VERIFY_OVERLAP_MIN) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const na = normalizeEntryKey(a);
+  const nb = normalizeEntryKey(b);
+  if (!na || !nb) return false;
+  const short = na.length <= nb.length ? na : nb;
+  const long = short === na ? nb : na;
+  if (short.length < minLen) return false;
+  for (let i = 0; i <= short.length - minLen; i += 1) {
+    if (long.includes(short.slice(i, i + minLen))) return true;
+  }
+  return false;
+}
+
+/** 高 stakes 判定（纯函数，R6 可操作化，定稿 v2 §六-1）。
+ * 输入：/recall 响应 results（注入候选批）+ env（STAKE_TOPICS 白名单）。
+ * ①冲突：候选条目与同批高信任条目（trust ≥ HIGH_TRUST_MIN：无 ⚠️标注 =
+ *   默认 1.0，integration_service 只注 confidence<0.5 → 高信任≈未标注）
+ *   共享 ≥VERIFY_OVERLAP_MIN 字片段；②敏感话题：候选文本含白名单关键词。
+ * [doubt] 前缀条目（系统事件）双向排除（防回声防线 1）。
+ * 返回 [{candidate, highTrustMatch, reason}]；reason: "conflict" | "topic"。
+ * 无高 stakes → []（调用方零开销）。 */
+export function detectHighStakes(results, env) {
+  if (!Array.isArray(results) || results.length === 0) return [];
+  const e = env && typeof env === "object" ? env : {};
+  const topicsRaw = String(e.STAKE_TOPICS || "").trim();
+  const topics = topicsRaw
+    ? topicsRaw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+    : [];
+  const entries = results
+    .map((it) => ({
+      text: typeof it?.text === "string"
+        ? it.text.trim().replace(/\s+/g, " ") : "",
+      trust: parseConfidenceTag(it?.text) ?? 1.0,
+      raw: it,
+    }))
+    .filter((x) => x.text && !VERIFY_DOUBT_PREFIX_RE.test(x.text));
+  const out = [];
+  const seen = new Set();
+  for (const cand of entries) {
+    // ② 敏感话题白名单（env STAKE_TOPICS；默认空 = 全走冲突判定）
+    if (topics.length > 0 && topics.some((t) => cand.text.toLowerCase().includes(t))) {
+      const k = `topic:${normalizeEntryKey(cand.text)}`;
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push({ candidate: cand.raw, highTrustMatch: null, reason: "topic" });
+      }
+      continue;
+    }
+    // ① 冲突：候选 vs 高信任条目（共享片段；同文重复是 P1-2 去重职责，非冲突）
+    if (entries.length < 2) continue;
+    for (const h of entries) {
+      if (h === cand) continue;
+      if (h.trust < HIGH_TRUST_MIN) continue;
+      if (h.text === cand.text) continue;
+      if (!overlapMatch(cand.text, h.text)) continue;
+      const k = `conflict:${normalizeEntryKey(cand.text)}`;
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push({ candidate: cand.raw, highTrustMatch: h.raw, reason: "conflict" });
+      }
+    }
+  }
+  return out;
+}
+
+/** 独立验证检索（CoVe 验证步）：直调 LMS POST /recall（只读，同 P1-2
+ * 窄路径端点：count_reference=False 零持久化）。
+ * 返回 [{text, consistency, adaptiveConfidence, doubtVerdict}]；
+ * 失败/超时/非 2xx → null（fail-open，黑盒降级 = 不确认）。 */
+export async function fetchLmsVerify(cfg, queryText) {
+  const url = `${cfg.lmsUrl}/recall`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: String(queryText || "").slice(0, QUERY_MAX_CHARS),
+        k: VERIFY_K_DEFAULT,
+        session_id: cfg.landscapeSid || LANDSCAPE_SID,
+      }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      logMiss(`verify-non-2xx status=${resp.status} url=${url}`);
+      return null;
+    }
+    const data = await resp.json();
+    const results = Array.isArray(data && data.results) ? data.results : [];
+    return results.map((r) => ({
+      text: String((r && r.text) || "").trim(),
+      consistency: typeof r.consistency === "number" ? r.consistency : null,
+      adaptiveConfidence: typeof r.adaptive_confidence === "number"
+        ? r.adaptive_confidence : null,
+      doubtVerdict: r.doubt_verdict === true,
+    }));
+  } catch (err) {
+    const why = err && err.name === "AbortError" ? "timeout" : "network-error";
+    logMiss(`verify-${why} url=${url} timeoutMs=${VERIFY_TIMEOUT_MS}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// P1-3 provenance 日志（VERIFY-*：输入/验证源/结果/时间戳；同 logMiss 模式，
+// 日志失败绝不影响主流程）。candidate/highTrust/query 截 40 字（防刷屏）。
+function logVerify(kind, fields) {
+  try {
+    const bits = Object.entries(fields || {}).map(([k, v]) => {
+      if (k === "candidate" || k === "highTrust" || k === "query"
+          || k === "queryV1" || k === "queryV2") {
+        return `${k}=${JSON.stringify(String(v).slice(0, 40))}`;
+      }
+      return `${k}=${v}`;
+    });
+    appendFileSync(DEBUG_LOG_FILE, `[${new Date().toISOString()}] VERIFY-${kind} ${bits.join(" ")}\n`);
+  } catch { /* 日志失败忽略 */ }
+}
+
+// P1-3 参数先落盘（R8 纪律）：常量 + STAKE_TOPICS 白名单，每进程一次。
+let verifyParamsLogged = false;
+function logVerifyParams() {
+  if (verifyParamsLogged) return;
+  verifyParamsLogged = true;
+  try {
+    const topics = String(process.env.STAKE_TOPICS || "").trim()
+      || "(empty=conflict-only)";
+    appendFileSync(
+      DEBUG_LOG_FILE,
+      `[${new Date().toISOString()}] VERIFY-PARAMS max_chains=${VERIFY_MAX_CHAINS} k=${VERIFY_K_DEFAULT} timeout_ms=${VERIFY_TIMEOUT_MS} overlap_min=${VERIFY_OVERLAP_MIN} high_trust_min=${HIGH_TRUST_MIN} write_dedup_ms=${VERIFY_WRITE_DEDUP_MS} stake_topics=${JSON.stringify(topics)}\n`,
+    );
+  } catch { /* 日志失败忽略 */ }
+}
+
+// 写侧 60s 幂等窗口（normalizedKey → last 成功写入 ts；防同冲突重复写回声）
+const verifyWriteLog = new Map();
+
+/** 写 [doubt] conflict 事件（POST {lmsUrl}/feed，doubt_ingest conflict 事件
+ * → _find_overlapping_entry → mark_labile，Nader 2000 再巩固入口）。
+ * 内容 = normalizeEntryKey(候选文本)（剥 ⚠️置信 标注——集成层读时注解，
+ * episodic 存储无标注；带标注写会让 _find_overlapping_entry 包含匹配
+ * 失败 → 证伪落空）。截 300 字（doubt_ingest 内容上限）。
+ * fire-and-forget：调用方不 await（不阻塞注入热路径）；成功才记幂等窗口
+ * （失败/丢失不占窗口，下轮高 stakes 可重写）。返回 Promise<boolean>。 */
+async function writeDoubtConflict(cfg, candidateText) {
+  const key = normalizeEntryKey(candidateText);
+  const now = Date.now();
+  const last = verifyWriteLog.get(key);
+  if (last !== undefined && now - last < VERIFY_WRITE_DEDUP_MS) {
+    logVerify("WRITE-DEDUP", { key, since_ms: now - last });
+    return false;
+  }
+  const url = `${cfg.lmsUrl}/feed`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), VERIFY_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: `[doubt] conflict: ${key.slice(0, 300)}`,
+        session_id: cfg.landscapeSid || LANDSCAPE_SID,
+        source: "glue-memory-injector",
+        sender: "p1-3-verify",
+      }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      logMiss(`verify-write-non-2xx status=${resp.status} url=${url}`);
+      return false;
+    }
+    verifyWriteLog.set(key, now);
+    return true;
+  } catch (err) {
+    const why = err && err.name === "AbortError" ? "timeout" : "network-error";
+    logMiss(`verify-write-${why} url=${url}`);
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 注入时验证链主流程（CoVe 轻量：草稿→独立验证→修正）。
+ * 返回 verifyByText map：normalizeEntryKey(候选) → {verdict, reason, highTrust}
+ * （仅 conflict-确认 入 map——topic 只验不标；无高 stakes / 无确认 → null）。
+ * 草稿 = 冲突/敏感声明（VERIFY-TRIGGER 日志含输入）；独立验证 = V1(H 复现)
+ * + V2(E 复现) 并行（防伪独立四条保证见段注释）；修正 = 确认 → 注入面标注
+ * [doubt] conflict（buildContextText 消费）+ 写 [doubt] conflict → /feed。 */
+export async function runVerifyChain(cfg, userQuery, results) {
+  const stakes = detectHighStakes(results, process.env);
+  if (stakes.length === 0) return null; // 零开销：无 HTTP、无日志
+  const chains = stakes.slice(0, VERIFY_MAX_CHAINS);
+  const out = {};
+  // 草稿（Draft）：声明 + provenance（输入入日志）
+  for (const s of chains) {
+    logVerify("TRIGGER", {
+      reason: s.reason,
+      query: userQuery,
+      candidate: s.candidate && s.candidate.text,
+      highTrust: s.highTrustMatch ? s.highTrustMatch.text : "-",
+    });
+  }
+  // 同 query 批次复用（双方向冲突对 E↔H 时，H-query/E-query 各只取一次独立
+  // 批次——仍是草稿批次之外的独立采样，防伪独立不受影响；省冗余 HTTP）
+  const memo = new Map();
+  const verifyFetch = (q) => {
+    if (memo.has(q)) return memo.get(q);
+    const p = fetchLmsVerify(cfg, q);
+    memo.set(q, p);
+    return p;
+  };
+  // 独立验证（Independent）：全部链的 V1/V2 并行（互不等待，各 4s 超时）
+  const pairs = await Promise.all(chains.map((s) => Promise.all([
+    s.highTrustMatch
+      ? verifyFetch(normalizeEntryKey(s.highTrustMatch.text))
+      : Promise.resolve(null),
+    verifyFetch(normalizeEntryKey(s.candidate.text)),
+  ])));
+  for (let i = 0; i < chains.length; i += 1) {
+    const s = chains[i];
+    const [v1, v2] = pairs[i];
+    const hText = s.highTrustMatch ? normalizeEntryKey(s.highTrustMatch.text) : null;
+    const cText = normalizeEntryKey(s.candidate.text);
+    const hMatch = hText && v1
+      ? v1.find((r) => r.text && overlapMatch(hText, r.text)) : null;
+    const eMatch = v2
+      ? v2.find((r) => r.text && overlapMatch(cText, r.text)) : null;
+    // H 复现要求 doubt_verdict !== true（LMS conformal 分位已标怀疑的 H，
+    // 不足以作为"高信任参照"）；E 复现不要求（E 被怀疑与冲突叙事自洽）
+    const hRepro = hText !== null && !!hMatch && hMatch.doubtVerdict !== true;
+    const eRepro = !!eMatch;
+    logVerify("INDEP", {
+      source: "lms-direct-recall",
+      batchV1: v1 ? v1.length : -1,
+      batchV2: v2 ? v2.length : -1,
+      hRepro,
+      eRepro,
+      hCons: hMatch && hMatch.consistency !== null
+        ? hMatch.consistency.toFixed(2) : "-",
+      eCons: eMatch && eMatch.consistency !== null
+        ? eMatch.consistency.toFixed(2) : "-",
+      queryV1: hText || "-",
+      queryV2: cText,
+    });
+    if (s.reason === "conflict") {
+      const confirmed = hRepro && eRepro;
+      logVerify("RESULT", {
+        verdict: confirmed ? "confirmed" : "not-confirmed",
+        reason: "conflict",
+        candidate: s.candidate.text,
+        highTrust: hText,
+      });
+      if (confirmed) {
+        out[normalizeEntryKey(s.candidate.text)] = {
+          verdict: "confirmed", reason: "conflict", highTrust: hText,
+        };
+        // 修正：写 [doubt] conflict → /feed（fire-and-forget：不阻塞注入热
+        // 路径；结果入 VERIFY-WRITE 日志，ok=true/false 可查）
+        writeDoubtConflict(cfg, s.candidate.text)
+          .then((ok) => logVerify("WRITE", {
+            endpoint: "/feed", kind: "conflict", ok,
+            candidate: s.candidate.text,
+          }))
+          .catch(() => logVerify("WRITE", {
+            endpoint: "/feed", kind: "conflict", ok: false,
+            candidate: s.candidate.text,
+          }));
+      }
+    } else {
+      // 敏感话题：验证候选可复现性；topic 非 conflict，不写 labile、不标注
+      logVerify("RESULT", {
+        verdict: eRepro ? "ok" : "not-confirmed",
+        reason: "topic",
+        candidate: s.candidate.text,
+        eRepro,
+        eCons: eMatch && eMatch.consistency !== null
+          ? eMatch.consistency.toFixed(2) : "-",
+      });
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 /**
  * 把 /recall 响应整理为注入文本（≤maxChars）——阶段 1 六层注入的 ④⑤⑥ 层：
  * 焦点记忆（3-5 条，Cowan 4±1）+ 质疑层 + 行动层占位。
@@ -1303,8 +1650,12 @@ function logScoreDoubt(mode, trust, before, after, annotated, snippet) {
  * @param {object|null} activatedThought 阶段 4：当前对话激活的 thought（可选，
  *   默认 null）。它的 action 字段（行动意向四问）经 buildActionLayer 注入⑥行动层；
  *   无激活 thought / 无 action → 回退占位。仅展示意向，零执行动作。
+ * @param {object|null} verifyByText 阶段 2 步骤 4（P1-3）：注入时验证链产物
+ *   map（normalizeEntryKey(候选) → {verdict, reason, highTrust}，runVerifyChain
+ *   返回）。conflict-确认 条目在注入面标注 [doubt] conflict（可见怀疑，与 P1-2
+ *   [doubt] lowconf 正交——冲突标注是验证结果，非低信任惩罚）。缺省 null。
  */
-export function buildContextText(data, query, maxChars, skipSelfRef = false, reactData = null, activatedThought = null, consistencyByText = null) {
+export function buildContextText(data, query, maxChars, skipSelfRef = false, reactData = null, activatedThought = null, consistencyByText = null, verifyByText = null) {
   if (!data || typeof data !== "object") {
     logMiss("recall-invalid-response"); // P0-1：/recall 响应结构异常
     return null;
@@ -1395,7 +1746,16 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
     const meta = it.origin
       ? `[${it.origin}${it.score !== null ? `·分${it.score.toFixed(2)}` : ""}·权${it.weight.toFixed(2)}]`
       : "";
-    lines.push(`${i + 1}. ${meta} ${it.text}${it.lowTrustAnnotated ? " [doubt] lowconf" : ""}`);
+    // P1-3：注入时验证链产物（verifyByText，按归一化 text join）——
+    // conflict-确认 条目追加 [doubt] conflict（可见怀疑：本条目与高信任记忆
+    // 冲突且经独立验证确认；详情在 VERIFY-* 日志，provenance 可查）。
+    // 与 [doubt] lowconf 正交：冲突标注是验证结果，非低信任惩罚（R1 二选一
+    // 是 P1-2 的 trust 语义，本标注是 P1-3 的验证语义，互不替代）。
+    const vEntry = verifyByText && typeof verifyByText === "object"
+      ? verifyByText[normalizeEntryKey(it.text)] : null;
+    const conflictTag = vEntry && vEntry.verdict === "confirmed"
+      ? " [doubt] conflict" : "";
+    lines.push(`${i + 1}. ${meta} ${it.text}${it.lowTrustAnnotated ? " [doubt] lowconf" : ""}${conflictTag}`);
   }
 
   // ⑤ 质疑层 + ⑥ 行动层（阶段 4：激活的 thought 才带行动意向；无则占位）
@@ -1516,6 +1876,7 @@ export async function buildMemoryContext(prompt, pluginConfig) {
     return null;
   }
   logScoreParams(resolveScoreParams(process.env)); // P1-2 参数先落盘（每进程一次）
+  logVerifyParams(); // P1-3 参数先落盘（每进程一次）
   // 召回L1-a（2026-08-11）：query 净化 —— 剥离 openclaw 元数据块/时间戳/
   // 子代理模板，取用户真实正文前 QUERY_MAX_CHARS 字；纯模板/心跳 → null 不注入；
   // 净化异常回落原逻辑（fail-open）。
@@ -1595,9 +1956,20 @@ export async function buildMemoryContext(prompt, pluginConfig) {
         consistencyByText = await fetchLmsRecallConsistency(cfg, query) || null;
       }
     }
+    // P1-3 注入时验证链（定稿 v2 §六，2026-08-16）：高 stakes（①注入内容与
+    // 高信任记忆冲突 ②STAKE_TOPICS 敏感话题）→ 草稿→独立验证→修正。
+    // 产物 map 透传 buildContextText（conflict-确认 → 注入面 [doubt] conflict
+    // 标注）+ [doubt] conflict 写 /feed（fire-and-forget → doubt_ingest
+    // conflict 事件 → mark_labile，Nader 2000 再巩固入口）。
+    // 零开销契约：无高 stakes → 零 HTTP、零日志、注入面零改动。
+    let verifyByText = null;
+    if (cfg.verifyChainEnabled && recallData && Array.isArray(recallData.results)) {
+      verifyByText = await runVerifyChain(cfg, query, recallData.results);
+    }
     // reactData 透传给 buildContextText：质疑层需要全局 precision 信号；
-    // consistencyByText：P1-2 consistency 窄路径数据（缺省 null → 静态默认）
-    const memoryText = buildContextText(recallData, query, memoryBudget, Boolean(soulText), reactData, pickedThought, consistencyByText);
+    // consistencyByText：P1-2 consistency 窄路径数据（缺省 null → 静态默认）；
+    // verifyByText：P1-3 验证链产物（缺省 null → 无冲突标注）
+    const memoryText = buildContextText(recallData, query, memoryBudget, Boolean(soulText), reactData, pickedThought, consistencyByText, verifyByText);
 
     return composeContext(soulText, memoryText, injectBudget);
   } catch (err) {

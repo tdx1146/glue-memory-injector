@@ -13,7 +13,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,6 +34,10 @@ const {
   buildThoughtLayer,
   fetchLandscape,
   fetchLmsRecallConsistency,
+  overlapMatch,
+  detectHighStakes,
+  fetchLmsVerify,
+  runVerifyChain,
   resolveScoreParams,
   normalizeEntryKey,
   trustDistributionStats,
@@ -561,6 +565,353 @@ await okAsync("P1-2 窄路径：无低信任条目（常态）→ 零额外 LMS 
   } finally {
     server.close();
     lmsServer.close();
+  }
+});
+
+// ---- 阶段 2 步骤 4（P1-3 注入时验证链，定稿 v2 §六）----
+
+ok("P1-3 overlapMatch：共享片段匹配（冲突对命中，无关对不命中）", () => {
+  // 真实冲突对：前缀相同、取值相反（任务书验收场景）→ 5 字共享片段命中
+  assert.equal(overlapMatch("用户生日是8月30日", "用户生日是8月15日"), true);
+  // 无关对 → 不命中
+  assert.equal(overlapMatch("完全不相关的甲乙丙丁", "用户生日聚会很隆重"), false);
+  // 含 ⚠️置信 标注（读时注解）归一化后仍命中
+  assert.equal(overlapMatch("用户生日是8月30日 ⚠️置信0.2", "用户生日是8月15日"), true);
+  // 同文（重复）→ 命中（去重是 P1-2 职责；检测层不拦）
+  assert.equal(overlapMatch("用户生日是8月30日", "用户生日是8月30日"), true);
+  // 短文本 < minLen(5) → 不命中（防高频短词伪冲突）
+  assert.equal(overlapMatch("生日", "生日"), false);
+  // 空/非字符串 → false（fail-open）
+  assert.equal(overlapMatch(null, "x"), false);
+  assert.equal(overlapMatch("", "x"), false);
+});
+
+ok("P1-3 detectHighStakes：冲突检测（候选 vs 高信任条目）", () => {
+  const results = [
+    { id: "e", text: "用户生日是8月30日 ⚠️置信0.2", origin: "lms" },
+    { id: "h", text: "用户生日是8月15日", origin: "lms" },
+    { id: "x", text: "无关条目", origin: "lms" },
+  ];
+  const stakes = detectHighStakes(results, {});
+  assert.equal(stakes.length, 1, "应恰好 1 个冲突 stake（候选 E vs 高信任 H）");
+  assert.equal(stakes[0].reason, "conflict", "reason 应为 conflict");
+  assert.equal(stakes[0].candidate.id, "e");
+  assert.equal(stakes[0].highTrustMatch.id, "h", "高信任参照应为未标注条目");
+});
+
+ok("P1-3 detectHighStakes：无冲突 → []（零开销契约）", () => {
+  const results = [
+    { id: "a", text: "完全无关的甲乙丙丁", origin: "lms" },
+    { id: "b", text: "用户生日聚会很隆重", origin: "lms" },
+  ];
+  assert.equal(detectHighStakes(results, {}).length, 0, "无共享片段 → 无 stake");
+  assert.equal(detectHighStakes([], {}).length, 0, "空批 → []");
+  assert.equal(detectHighStakes(null, {}).length, 0, "null → []（fail-open）");
+});
+
+ok("P1-3 detectHighStakes：同文重复非冲突 + [doubt] 系统事件非候选（防回声）", () => {
+  // 同文重复（P1-2 去重职责）→ 不触发
+  const dup = [
+    { id: "a", text: "用户生日是8月30日" },
+    { id: "b", text: "用户生日是8月30日" },
+  ];
+  assert.equal(detectHighStakes(dup, {}).length, 0, "同文重复非冲突");
+  // [doubt] 前缀条目（验证链自身产物）双向排除 → 不触发（防回声防线 1）
+  const doubt = [
+    { id: "d", text: "[doubt] conflict: 用户生日是8月30日" },
+    { id: "h", text: "用户生日是8月30日聚会" },
+  ];
+  assert.equal(detectHighStakes(doubt, {}).length, 0, "[doubt] 系统事件非候选非参照");
+});
+
+ok("P1-3 detectHighStakes：STAKE_TOPICS 白名单（敏感话题 → topic stake）", () => {
+  const results = [
+    { id: "a", text: "用户生日聚会细节记录", origin: "lms" },
+    { id: "b", text: "无关条目", origin: "lms" },
+  ];
+  // 默认（env 空）→ 全走冲突判定：无冲突 → []
+  assert.equal(detectHighStakes(results, {}).length, 0, "默认空白名单 → 全走冲突判定");
+  // 白名单命中 → topic stake
+  const topicStakes = detectHighStakes(results, { STAKE_TOPICS: "生日,健康" });
+  assert.equal(topicStakes.length, 1);
+  assert.equal(topicStakes[0].reason, "topic");
+  assert.equal(topicStakes[0].candidate.id, "a");
+  assert.equal(topicStakes[0].highTrustMatch, null, "topic stake 无高信任参照");
+  // 白名单不命中 → 不触发
+  assert.equal(detectHighStakes(results, { STAKE_TOPICS: "健康" }).length, 0);
+  // 单条目批 + 白名单命中 → topic 仍触发（话题判定不依赖配对）
+  assert.equal(
+    detectHighStakes([{ id: "a", text: "用户生日聚会细节记录" }], { STAKE_TOPICS: "生日" }).length,
+    1,
+  );
+});
+
+// 读 VERIFY-* 日志（共享调试文件，按唯一 marker 过滤本测试行）
+function readVerifyLogs(marker) {
+  try {
+    const content = readFileSync("/tmp/glue-hook-debug.log", "utf-8");
+    return content.split("\n").filter((l) => l.includes("VERIFY-") && l.includes(marker));
+  } catch {
+    return [];
+  }
+}
+
+// 轮询 mock 状态（写侧 fire-and-forget：/feed 写与注入解耦）
+async function waitFor(fn, timeoutMs = 2500) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (fn()) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return fn();
+}
+
+await okAsync("P1-3 验证链：冲突场景 → 独立验证确认 → [doubt] conflict 注入标注 + /feed 写出（labile 入口）", async () => {
+  const lmsState = { recallHits: 0, feedHits: 0, feedBodies: [] };
+  const lmsServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/landscape/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ session_id: "main", landscape: { num_nodes: 2, activation: { entropy_norm: 0.5, active_nodes: 2, top_activated: [{ node: 1, sigma: 0.6 }, { node: 2, sigma: 0.4 }] } } }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/recall")) {
+        lmsState.recallHits += 1;
+        const q = JSON.parse(body).query || "";
+        res.writeHead(200, { "Content-Type": "application/json" });
+        // 验证批次路由：H 复现（8月15）→ 高一致未怀疑；E 复现（8月30）→ 低一致被怀疑
+        const out = q.includes("8月15")
+          ? [{ text: "用户生日P13B是8月15日", consistency: 0.9, adaptive_confidence: 0.9, doubt_verdict: false }]
+          : q.includes("8月30")
+            ? [{ text: "用户生日P13A是8月30日", consistency: 0.3, adaptive_confidence: 0.2, doubt_verdict: true }]
+            : [];
+        res.end(JSON.stringify({ results: out }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/feed")) {
+        lmsState.feedHits += 1;
+        lmsState.feedBodies.push(JSON.parse(body));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => lmsServer.listen(0, "127.0.0.1", r));
+  const { server, port } = await startMockGlue([
+    { id: "e", text: "用户生日P13A是8月30日 ⚠️置信0.2", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+    { id: "h", text: "用户生日P13B是8月15日", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+  ], { soul: null });
+  try {
+    _resetRateLimitForTest();
+    const text = await buildMemoryContext("测试生日P13冲突", {
+      glueUrl: `http://127.0.0.1:${port}`,
+      lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
+      landscapeSid: "main",
+      minIntervalMs: 0,
+      maxChars: 800,
+    });
+    assert.ok(text && text.includes("[记忆注入]"), "应注入");
+    // 注入面标注（验证确认的冲突 → [doubt] conflict 可见）
+    assert.ok(text.includes("[doubt] conflict"), `冲突确认 → 注入面应标 [doubt] conflict，实际 ${text}`);
+    assert.ok(text.includes("权0.72"), `高信任 H 正常权重（0.72），实际 ${text}`);
+    assert.ok(text.includes("权0.09"), `低信任 E 降权（P1-2 0.09），实际 ${text}`);
+    // [doubt] conflict 写 /feed（fire-and-forget，轮询确认）
+    const fed = await waitFor(() => lmsState.feedHits === 1);
+    assert.ok(fed, `应恰好 1 次 /feed 写出，实际 ${lmsState.feedHits}`);
+    assert.ok(
+      lmsState.feedBodies[0].text.startsWith("[doubt] conflict: 用户生日P13A是8月30日"),
+      `/feed 文本应为 [doubt] conflict 协议（剥 ⚠️标注），实际 ${lmsState.feedBodies[0].text}`,
+    );
+    assert.ok(!lmsState.feedBodies[0].text.includes("⚠️"), "写侧内容不得含读时注解（防证伪落空）");
+    assert.equal(lmsState.feedBodies[0].sender, "p1-3-verify", "sender 应标记验证链来源");
+    // 独立验证 = 2 次 LMS /recall（V1/H + V2/E）+ P1-2 窄路径 1 次（E 低信任）
+    assert.equal(lmsState.recallHits, 3, `验证 2 + 窄路径 1 = 3 次 LMS /recall，实际 ${lmsState.recallHits}`);
+    // provenance：VERIFY-* 日志含（输入/验证源/结果/时间戳）
+    await new Promise((r) => setTimeout(r, 150)); // 等 fire-and-forget 的 WRITE 日志落盘
+    const logs = readVerifyLogs("生日P13");
+    assert.ok(logs.some((l) => l.includes("VERIFY-TRIGGER") && l.includes("reason=conflict")), `应有 VERIFY-TRIGGER（草稿），实际 ${logs.join("\n")}`);
+    assert.ok(logs.some((l) => l.includes("VERIFY-INDEP") && l.includes("source=lms-direct-recall") && l.includes("hRepro=true") && l.includes("eRepro=true")), `应有 VERIFY-INDEP（独立验证源），实际 ${logs.join("\n")}`);
+    assert.ok(logs.some((l) => l.includes("VERIFY-RESULT") && l.includes("verdict=confirmed")), `应有 VERIFY-RESULT verdict=confirmed，实际 ${logs.join("\n")}`);
+    assert.ok(logs.some((l) => l.includes("VERIFY-WRITE") && l.includes("ok=true")), `应有 VERIFY-WRITE ok=true，实际 ${logs.join("\n")}`);
+  } finally {
+    server.close();
+    lmsServer.close();
+  }
+});
+
+await okAsync("P1-3 验证链：独立验证未确认（H 不可复现）→ 不写 /feed、不标注（拦截虚假 labile）", async () => {
+  const lmsState = { recallHits: 0, feedHits: 0 };
+  const lmsServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/landscape/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ session_id: "main", landscape: { num_nodes: 2, activation: { entropy_norm: 0.5, active_nodes: 2, top_activated: [{ node: 1, sigma: 0.6 }, { node: 2, sigma: 0.4 }] } } }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/recall")) {
+        lmsState.recallHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ results: [] })); // 独立批次查无 H → 不可复现
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/feed")) {
+        lmsState.feedHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => lmsServer.listen(0, "127.0.0.1", r));
+  const { server, port } = await startMockGlue([
+    { id: "e", text: "用户生日P14A是8月30日", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+    { id: "h", text: "用户生日P14B是8月15日", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+  ], { soul: null });
+  try {
+    _resetRateLimitForTest();
+    const text = await buildMemoryContext("测试生日P14冲突", {
+      glueUrl: `http://127.0.0.1:${port}`,
+      lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
+      landscapeSid: "main",
+      minIntervalMs: 0,
+      maxChars: 800,
+    });
+    assert.ok(text && text.includes("[记忆注入]"), "应注入");
+    assert.ok(!text.includes("[doubt] conflict"), `未确认 → 注入面不标注，实际 ${text}`);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(lmsState.feedHits, 0, "未确认 → 零 /feed 写出（拦截虚假 labile 标记）");
+    assert.equal(lmsState.recallHits, 2, `V1+H 不可复现 + V2+E = 2 次验证检索，实际 ${lmsState.recallHits}`);
+    const logs = readVerifyLogs("生日P14");
+    assert.ok(logs.some((l) => l.includes("VERIFY-RESULT") && l.includes("verdict=not-confirmed")), `应有 VERIFY-RESULT verdict=not-confirmed，实际 ${logs.join("\n")}`);
+  } finally {
+    server.close();
+    lmsServer.close();
+  }
+});
+
+await okAsync("P1-3 零开销契约：无冲突 → 零验证 HTTP、零日志、注入面零改动", async () => {
+  const lmsState = { recallHits: 0, feedHits: 0 };
+  const lmsServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/landscape/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ session_id: "main", landscape: { num_nodes: 2, activation: { entropy_norm: 0.5, active_nodes: 2, top_activated: [{ node: 1, sigma: 0.6 }, { node: 2, sigma: 0.4 }] } } }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/recall")) {
+        lmsState.recallHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ results: [] }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/feed")) {
+        lmsState.feedHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => lmsServer.listen(0, "127.0.0.1", r));
+  const { server, port } = await startMockGlue([
+    { id: "a", text: "完全无关的甲乙丙丁P15", origin: "lms", scores: { total: 0.7, lms_activation: 1.0 } },
+    { id: "b", text: "用户生日聚会很隆重P15", origin: "lms", scores: { total: 0.6, lms_activation: 1.0 } },
+  ], { soul: null });
+  try {
+    _resetRateLimitForTest();
+    const text = await buildMemoryContext("测试生日P15无关", {
+      glueUrl: `http://127.0.0.1:${port}`,
+      lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
+      landscapeSid: "main",
+      minIntervalMs: 0,
+      maxChars: 800,
+    });
+    assert.ok(text && text.includes("[记忆注入]"), "应注入");
+    assert.ok(!text.includes("[doubt] conflict"), `注入面零改动，实际 ${text}`);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(lmsState.recallHits, 0, "无高 stakes → 零 LMS /recall（验证链零 HTTP）");
+    assert.equal(lmsState.feedHits, 0, "无高 stakes → 零 /feed");
+    assert.equal(readVerifyLogs("生日P15").length, 0, "无高 stakes → 零 VERIFY-* 日志");
+  } finally {
+    server.close();
+    lmsServer.close();
+  }
+});
+
+await okAsync("P1-3 敏感话题：STAKE_TOPICS 白名单 → 验证候选可复现性（不写 labile、不标注）", async () => {
+  const prev = process.env.STAKE_TOPICS;
+  process.env.STAKE_TOPICS = "生日P16";
+  const lmsState = { recallHits: 0, feedHits: 0 };
+  const lmsServer = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (req.method === "GET" && req.url.startsWith("/landscape/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ session_id: "main", landscape: { num_nodes: 2, activation: { entropy_norm: 0.5, active_nodes: 2, top_activated: [{ node: 1, sigma: 0.6 }, { node: 2, sigma: 0.4 }] } } }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/recall")) {
+        lmsState.recallHits += 1;
+        const q = JSON.parse(body).query || "";
+        res.writeHead(200, { "Content-Type": "application/json" });
+        const out = q.includes("P16")
+          ? [{ text: "生日P16A聚会细节", consistency: 0.7, adaptive_confidence: 0.6, doubt_verdict: false }]
+          : [];
+        res.end(JSON.stringify({ results: out }));
+        return;
+      }
+      if (req.method === "POST" && req.url.startsWith("/feed")) {
+        lmsState.feedHits += 1;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end("{}");
+    });
+  });
+  await new Promise((r) => lmsServer.listen(0, "127.0.0.1", r));
+  const { server, port } = await startMockGlue([
+    { id: "e", text: "生日P16A聚会细节 ⚠️置信0.2", origin: "lms", scores: { total: 0.9, lms_activation: 1.0 } },
+    { id: "h", text: "无关条目P16", origin: "lms", scores: { total: 0.5, lms_activation: 1.0 } },
+  ], { soul: null });
+  try {
+    _resetRateLimitForTest();
+    const text = await buildMemoryContext("测试生日P16话题", {
+      glueUrl: `http://127.0.0.1:${port}`,
+      lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
+      landscapeSid: "main",
+      minIntervalMs: 0,
+      maxChars: 800,
+    });
+    assert.ok(text && text.includes("[记忆注入]"), "应注入");
+    assert.ok(!text.includes("[doubt] conflict"), `topic 验证不标注 conflict，实际 ${text}`);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(lmsState.feedHits, 0, "topic 非 conflict → 零 /feed 写出");
+    // P1-2 窄路径（E 低信任）1 次 + topic 验证 V2 1 次 = 2
+    assert.equal(lmsState.recallHits, 2, `窄路径 1 + topic 验证 1 = 2 次 LMS /recall，实际 ${lmsState.recallHits}`);
+    const logs = readVerifyLogs("生日P16");
+    assert.ok(logs.some((l) => l.includes("VERIFY-TRIGGER") && l.includes("reason=topic")), `应有 VERIFY-TRIGGER reason=topic，实际 ${logs.join("\n")}`);
+    assert.ok(logs.some((l) => l.includes("VERIFY-RESULT") && l.includes("verdict=ok")), `应有 VERIFY-RESULT verdict=ok（可复现），实际 ${logs.join("\n")}`);
+  } finally {
+    server.close();
+    lmsServer.close();
+    if (prev === undefined) delete process.env.STAKE_TOPICS;
+    else process.env.STAKE_TOPICS = prev;
   }
 });
 
