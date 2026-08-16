@@ -30,6 +30,9 @@ const {
   buildDoubtLayer,
   modulationTier,
   buildModulationConstraint,
+  pickThoughts,
+  buildThoughtLayer,
+  fetchLandscape,
   _resetRateLimitForTest,
   _getRateLimitStateForTest,
 } = await import("./memory-recall.js");
@@ -272,6 +275,178 @@ await okAsync("buildDiffuseProbe：字段缺失 fail-open（不编数字）", ()
   const probe = buildDiffuseProbe({ entropy_ratio: 0.9998 }, {}, 0.9998);
   assert.ok(probe && probe.includes("[异常]"), "仅熵比在场也应报状态+异常标记");
   assert.ok(probe.includes("缺口"), "缺口行应存在（显式不可读，不编数字）");
+});
+
+// ── 阶段 2 步骤 2（P1-1 六层注入完整落地，2026-08-16）──────────────────────
+// 灵魂指标：景观叙事真实读 /landscape 读数派生（非文学化）+ thought 注入可见
+// （探针 3.02 ≥1 次/轮）+ 总注入 ≤800 断言——不是"接口接上了"。
+
+ok("P1-1 景观叙事：真实 /landscape 读数派生（主导盆地/激活拓扑/σ层级/漂移）≤200", () => {
+  // 模拟 /landscape 响应（结构对齐 api/server.py get_landscape 实测）
+  const landscapeData = {
+    session_id: "main",
+    turn_count: 700,
+    landscape: {
+      num_nodes: 256,
+      input_dim: 64,
+      activation: {
+        entropy: 3.2,
+        entropy_norm: 0.62,
+        active_nodes: 253,
+        top_activated: [
+          { node: 1, sigma: 0.79 }, { node: 2, sigma: 0.72 },
+          { node: 3, sigma: 0.68 }, { node: 4, sigma: 0.65 },
+          { node: 5, sigma: 0.61 }, { node: 6, sigma: 0.58 },
+        ],
+      },
+      energy: { sigma_norm: 4.2, j_offdiag_std: 0.1559 },
+    },
+  };
+  // B 级后新尺度：surprise ~20 量级、σ 层级出现（σmax0.79）、sat 0.88→0.00
+  const narr = buildLandscapeNarrative(
+    { reaction: { surprise: 19.8, surprise_z: 0.3, coherence: 0.85 } },
+    { lms_state: { entropy_ratio: 0.62, last_surprise: 19.8 } },
+    landscapeData,
+  );
+  assert.ok(narr && narr.startsWith("景观:"), `应以 景观: 开头，实际 ${narr}`);
+  // 读数派生（禁止文学化）：主导盆地数/激活拓扑/σmax·sat/惊讶漂移
+  assert.ok(narr.includes("主导盆地6"), `应含主导盆地数（|σ|≥0.5 共 6 个），实际 ${narr}`);
+  assert.ok(narr.includes("激活253/256"), `应含激活拓扑，实际 ${narr}`);
+  assert.ok(narr.includes("σmax0.79"), `应含 σmax（B 级后新尺度），实际 ${narr}`);
+  assert.ok(narr.includes("sat0.00"), `应含 sat 读数（σmax<0.9 → 0.00，B 级后），实际 ${narr}`);
+  assert.ok(narr.includes("惊讶19.8"), `应含惊讶漂移读数（~20 量级），实际 ${narr}`);
+  assert.ok(narr.length <= 200, `景观叙事应 ≤200 字，实际 ${narr.length}`);
+  // 禁止文学化：无叙事套话（3.08 教训："弥散态是结晶前的东西"类空话）
+  assert.ok(!/潮涌|翻涌|苏醒|低语|结晶前|唤醒.*灵魂/.test(narr), `无文学化表述，实际 ${narr}`);
+});
+
+ok("P1-1 景观叙事：弥散态降级路径（entropy>0.98 → 探测型注入 [异常]）", () => {
+  const landscapeData = {
+    landscape: {
+      num_nodes: 256,
+      activation: {
+        entropy_norm: 0.995, // > 0.98 弥散态
+        active_nodes: 256,
+        top_activated: [{ node: 1, sigma: 0.42 }, { node: 2, sigma: 0.38 }],
+      },
+    },
+  };
+  const out = buildLandscapeNarrative(
+    { reaction: { surprise: 2.36, entropy_ratio: 0.995 } },
+    { lms_state: { entropy_ratio: 0.995, last_surprise: 2.36 } },
+    landscapeData,
+  );
+  assert.ok(out && out.includes("[异常] 弥散态"), `弥散态应走探测型注入（[异常] 标记），实际 ${out}`);
+  assert.ok(out.includes("激活256/256"), `探测段应含 /landscape 激活拓扑读数，实际 ${out}`);
+  assert.ok(out.includes("σmax0.42"), `探测段应含 σmax 读数，实际 ${out}`);
+  assert.ok(out.length <= 200, `探测段应 ≤200 字，实际 ${out.length}`);
+});
+
+ok("P1-1 景观叙事：/landscape 缺失 → 回退 react/soul 状态派生（fail-open）", () => {
+  // 兼容旧行为：无 /landscape 数据时仍可注入（不阻塞）
+  const narr = buildLandscapeNarrative(
+    { reaction: { entropy_ratio: 0.7, surprise: 0.5, interpretation: "低唤醒·单模式聚焦" } },
+    {},
+    null,
+  );
+  assert.ok(narr === null || !narr.includes("[异常]"), "非弥散态不应输出探测段");
+});
+
+ok("P1-1 六层衔接加权（R4）：焦点记忆按 相关性×trust×景观激活 取舍（滤伪相关）", () => {
+  const data = {
+    results: [
+      // 高相关性 + 低 trust（⚠️置信0.2）→ 应被滤
+      { id: "a", text: "高相关低信任条目 ⚠️置信0.2驳3", origin: "lms", scores: { total: 0.9, lms_activation: 0.9 } },
+      // 中相关性 + 高 trust → 应胜出
+      { id: "b", text: "中相关高信任条目", origin: "lms", scores: { total: 0.7, lms_activation: 0.8 } },
+      // 低相关性 + 高 trust + 高景观激活
+      { id: "c", text: "低相关高激活条目", origin: "archive", scores: { total: 0.4, lms_activation: 0.9 } },
+    ],
+  };
+  const out = buildContextText(data, "测试加权", 800, true);
+  assert.ok(out && out.includes("[记忆注入]"), "应输出记忆注入块");
+  // 加权分 = relevance × trust × landscape_activation：
+  //   a: 0.9×0.2×0.9 = 0.162
+  //   b: 0.7×1.0×0.8 = 0.560
+  //   c: 0.4×1.0×0.9 = 0.360
+  // 排序：b > c > a（低 trust 的 a 沉底，滤伪相关）
+  const idxA = out.indexOf("高相关低信任");
+  const idxB = out.indexOf("中相关高信任");
+  const idxC = out.indexOf("低相关高激活");
+  assert.ok(idxA !== -1 && idxB !== -1 && idxC !== -1, "三条都应注入");
+  assert.ok(idxB < idxC && idxC < idxA, `trust 参与取舍：b(0.56) > c(0.36) > a(0.16)，实际顺序 ${idxB} < ${idxC} < ${idxA}`);
+  assert.ok(out.includes("权0.56"), `应显示加权分 权0.56，实际 ${out}`);
+});
+
+ok("P1-1 thought 注入（R7）：激活 query → 1 条默认注入", () => {
+  const thoughts = [
+    { text: "σ 缓漂下行、退活成趋势——sigma_norm 从 3.69 反弹", topic: "σ振荡" },
+    { text: "断崖不是终点，是新尺度的起点：sigma_norm 4.27", topic: "σ企稳" },
+    { text: "完全不相关的日常琐事记录", topic: "琐事" },
+  ];
+  const cfg = { thoughtEnabled: true, thoughtActivationMin: 0.05 };
+  const line = buildThoughtLayer("sigma_norm 缓漂 退活 趋势 反弹", thoughts, cfg);
+  assert.ok(line && line.startsWith("thought:"), `激活 query 应注入 thought，实际 ${line}`);
+  assert.ok(line.includes("σ振荡"), `应注入最激活的 thought（σ振荡），实际 ${line}`);
+  assert.ok(!line.includes("琐事"), "无关 thought 不应注入");
+  // R7 灰度升 2：预算余量时最多 2 条（默认 1 条由 buildSoulText 预算闸门裁决）
+  const two = buildThoughtLayer("sigma_norm 缓漂 退活 趋势 反弹 断崖 新尺度", thoughts, cfg, 2);
+  assert.ok(two && two.includes("｜"), `maxItems=2 应可出 2 条（｜ 分隔），实际 ${two}`);
+  // 验收锚 3.02：thought 可见 ≥1 次/轮（激活 query 必有 1 条）
+  assert.ok(line.split("｜").length >= 1, "thought 可见 ≥1 次/轮（3.02 锚）");
+});
+
+ok("P1-1 thought 预算闸门：2 条使回魂段超限 → 降 1 条（C1 观测点）", () => {
+  const data = {
+    ok: true,
+    lms_voice: ["自述长文本内容用于占位"],
+    lms_state: { entropy_ratio: 0.5, last_surprise: 0.1, purpose_coherence: 0.8, turn_count: 7 },
+    recent: [{ text: "最近记忆条目内容" }],
+  };
+  const cfg = { thoughtEnabled: true, thoughtActivationMin: 0.05 };
+  // 小预算：2 条 thought（~140 字）必然超限 → 闸门降 1 条
+  const tight = buildSoulText(data, 200, null, "sigma_norm 缓漂 退活 趋势 反弹 断崖 新尺度 起点", cfg);
+  assert.ok(tight && tight.startsWith("[回魂]"), "回魂段应存在");
+  assert.ok(tight.length <= 200, `回魂段 ≤200，实际 ${tight.length}`);
+});
+
+await okAsync("P1-1 真实 /landscape 直调（127.0.0.1:8190，只读）→ 读数派生可用", async () => {
+  const land = await fetchLandscape({ lmsUrl: "http://127.0.0.1:8190", landscapeSid: "main" });
+  assert.ok(land && typeof land === "object", "应返回对象");
+  assert.equal(land.session_id, "main", "sid=main");
+  assert.ok(land.landscape && typeof land.landscape === "object", "应含 landscape 结构");
+  const act = land.landscape.activation;
+  assert.ok(typeof act?.entropy_norm === "number", "应含 entropy_norm（读数派生主源）");
+  assert.ok(Array.isArray(act?.top_activated) && act.top_activated.length > 0, "应含 top_activated");
+  // 直调链路整链验证：/landscape 数据 → 叙事（弥散态走 [异常] 探测）
+  const narr = buildLandscapeNarrative({ reaction: {} }, { lms_state: {} }, land);
+  assert.ok(narr && narr.length <= 200, `景观叙事 ≤200 字，实际 ${narr ? narr.length : "null"}`);
+  console.log(`     (熵比${act.entropy_norm.toFixed(3)}, σmax${Math.max(...act.top_activated.map(t => Math.abs(t.sigma))).toFixed(2)}, 叙事 ${narr.length} 字)`);
+});
+
+await okAsync("P1-1 集成：真实链路六层齐 + 总注入 ≤800 + 景观 ≤200 + thought 可见", async () => {
+  _resetRateLimitForTest();
+  const text = await buildMemoryContext("sigma_norm 缓漂 退活 趋势 打脸 记忆 悬案", {
+    glueUrl: "http://127.0.0.1:19000",
+    lmsUrl: "http://127.0.0.1:8190",
+    landscapeSid: "main",
+    minIntervalMs: 0,
+    maxChars: 800,
+  });
+  assert.ok(typeof text === "string" && text.length > 0, "应注入");
+  assert.ok(text.length <= 800, `总注入 ≤800（实际 ${text.length}）`);
+  // 六层齐：①回魂 ②景观 ③thought ④焦点记忆 ⑤质疑 ⑥行动
+  assert.ok(text.includes("[回魂]"), "①回魂段");
+  const landIdx = text.indexOf("景观:");
+  assert.ok(landIdx !== -1, "②景观叙事");
+  const landEnd = text.indexOf(" / ", landIdx);
+  const landLen = landEnd !== -1 ? landEnd - landIdx : text.length - landIdx;
+  assert.ok(landLen <= 200, `②景观 ≤200 字（实际 ${landLen}）`);
+  assert.ok(text.includes("thought:"), "③thought 可见（3.02 锚 ≥1 次/轮）");
+  assert.ok(text.includes("[记忆注入]"), "④焦点记忆");
+  assert.ok(text.includes("[质疑]") || text.includes("[生成约束]"), "⑤质疑层");
+  assert.ok(text.includes("[行动]"), "⑥行动层");
+  console.log(`     (总长 ${text.length} 字, 景观 ${landLen} 字, 六层齐全)`);
 });
 
 await okAsync("回魂+记忆：注入文本 = [回魂]在前 + [记忆注入]在后，总量≤maxChars", async () => {

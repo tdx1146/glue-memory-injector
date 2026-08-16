@@ -313,6 +313,7 @@ export function _resetRateLimitForTest() {
 // buildActionLayer 已随函数声明导出（见下，不在此重复导出）。
 // L1 生成约束（2026-08-14，状态调制生成·第一跳）：buildModulationConstraint /
 // modulationTier 导出供单测（纯函数，见下实现）。
+// 阶段 2 P1-1：fetchLandscape 已随函数声明 export（见上，不在此重复导出）。
 export { parseConfidenceTag, buildDoubtLayer, buildDiffuseProbe, buildLandscapeNarrative };
 
 // 仅供测试：读取限流状态
@@ -438,7 +439,8 @@ const DIFFUSE_ENTROPY_RATIO = (() => {
 })();
 
 /**
- * 探测型注入（阶段 1 弥散态专项，v1.2 §四定稿）——报数，不编故事。
+ * 探测型注入（阶段 1 弥散态专项，v1.2 §四定稿；阶段 2 P1-1 增 /landscape 读数）
+ * ——报数，不编故事。
  *
  * 弥散态下输出可验证的状态读数 + 显式 [异常] 标记（判据 3.09 v1.2 版：
  * “输出可验证的状态读数（具体数字/漂移量）+ 显式异常标记”）。
@@ -450,13 +452,17 @@ const DIFFUSE_ENTROPY_RATIO = (() => {
  *   [诊断标注（非读数）：惊讶度 mse 线性、方向无响应——供诊断/决策消费，
  *    不入“报数”行]
  *
+ * 阶段 2 P1-1：landscapeData 在场时，状态行并入 /landscape 激活拓扑读数
+ * （激活 A/N·σmax）——弥散态下 σ 扁平本身就是特征读数（B 级后尺度：
+ * sat 0.88→0.00、σmax 回落），报数不编故事。
+ *
  * 读数行只放可验证数字；诊断结论单列为 [诊断标注] 段（不入报数行）。
  * 数据源：/react reaction.{entropy_ratio,surprise,mse,precision_mean,coherence}
- *   + /soul lms_state.{entropy_ratio,last_surprise}。缺口计数（fok/low_confidence）
- *   当前无 /soul 字段，缺省标注“不可读”（不编数字）。fail-open：任何字段
- *   缺失 → 跳过该读数；全缺 → null（调用方回退旧行为）。
+ *   + /soul lms_state.{entropy_ratio,last_surprise} + /landscape activation。
+ * 缺口计数（fok/low_confidence）当前无 /soul 字段，缺省标注“不可读”（不编数字）。
+ * fail-open：任何字段缺失 → 跳过该读数；全缺 → null（调用方回退旧行为）。
  */
-function buildDiffuseProbe(react, st, entropyRatio) {
+function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
   if (typeof react !== "object" && typeof st !== "object") return null;
   const r = react && typeof react === "object" ? react : {};
   const s = st && typeof st === "object" ? st : {};
@@ -473,6 +479,22 @@ function buildDiffuseProbe(react, st, entropyRatio) {
   const precisionMean = typeof r.precision_mean === "number"
     ? r.precision_mean : null;
   const bits = [`熵${ent.toFixed(4)}`];
+  // 阶段 2 P1-1：/landscape 激活拓扑读数并入探测段（在场时；缺失跳过不编）
+  const land =
+    landscapeData && typeof landscapeData === "object" && landscapeData.landscape
+      && typeof landscapeData.landscape === "object" ? landscapeData.landscape : null;
+  const landAct = land && land.activation && typeof land.activation === "object"
+    ? land.activation : null;
+  if (landAct) {
+    if (typeof landAct.active_nodes === "number" && typeof land.num_nodes === "number") {
+      bits.push(`激活${landAct.active_nodes}/${land.num_nodes}`);
+    }
+    if (Array.isArray(landAct.top_activated) && landAct.top_activated.length > 0) {
+      const sigmaMax = Math.max(...landAct.top_activated
+        .map((t) => (t && typeof t.sigma === "number") ? Math.abs(t.sigma) : 0));
+      if (sigmaMax > 1e-9) bits.push(`σmax${sigmaMax.toFixed(2)}`);
+    }
+  }
   if (surprise !== null) bits.push(`惊讶${surprise.toFixed(2)}`);
   if (mse !== null) bits.push(`mse${mse.toFixed(3)}`);
   if (precisionMean !== null) bits.push(`π̄${precisionMean.toFixed(3)}`);
@@ -504,24 +526,30 @@ function buildDiffuseProbe(react, st, entropyRatio) {
 }
 
 /**
- * ② 景观叙事（阶段 1 六层注入，设计 v1.1 §三-2）——解读段扩权。
+ * ② 景观叙事（阶段 1 六层注入 + 阶段 2 P1-1 主缺口修复，2026-08-16）。
  *
- * 数据源（阶段 1 可用，均经 glue 只读端点，实测字段）：
- *   - /react interpretation：LMS 解码器自然语言解读（“什么在激活”主体）
- *   - /react reaction.surprise_z：惊讶涨落方向（>1 上升 / <-1 回落 / 平稳）
- *   - /react reaction.coherence｜/soul lms_state.purpose_coherence：目的稳定性
- *   - /soul lms_state.entropy_ratio / last_surprise：解读段缺席时的派生兜底
+ * 阶段 2 P1-1：**真实读 /landscape/{sid} 读数派生**（任务书灵魂指标：
+ * “景观叙事真实读 /landscape 读数派生（非文学化）”——不是“接口接上了”）。
+ * 数据源 = fetchLandscape 直调 LMS GET /landscape/{sid}（端点已存在，只读 fail-open）。
  *
- * 阶段 1 弥散态专项（v1.2 §四）：熵比 ≥ DIFFUSE_ENTROPY_RATIO 时走
- * 探测型注入分支 buildDiffuseProbe（报数 + [异常] 标记），不走叙事。
+ * 读数派生字段（全部可验证，禁止文学化）：
+ *   - 主导盆地数：top_activated 中 |σ| ≥ 0.5 的个数（B 级后新尺度 σmax≈0.79、
+ *     σ 层级出现：p10 0.575/p50 0.652/p90 0.727；0.5 以上=显著激活盆地）
+ *   - 激活拓扑：active_nodes/num_nodes（如 253/256）
+ *   - σ 层级：σmax + 峰差 Δ（top1−top2）+ sat 派生（σmax<0.9 ⇒ sat=0.00，
+ *     B 级后 sat 0.88→0.00 的读数依据——top_activated 含全局最大 |σ|）
+ *   - 漂移读数：惊讶（/react reaction.surprise 或 /soul last_surprise，
+ *     B 级后 ~20 量级）+ surprise_z 方向（>1 上升 / <-1 回落 / 平稳）
  *
- * 缺口（阶段 2 变更申报）：attractor.get_landscape() 可序列化但无 HTTP
- * 端点（api/server.py、api/control.py 均无 /landscape）——盆地结构/激活
- * 主题竞争拿不到；新端点列入阶段 2，本阶段不新增 LMS 端点（硬约束）。
+ * 弥散态降级路径（R4/定稿 v2 §四-3）：entropy > 0.98（DIFFUSE_ENTROPY_RATIO）
+ * → 探测型注入（buildDiffuseProbe：报数 + [异常] 标记），不输出激活主题叙事。
+ * 阈值源：/landscape activation.entropy_norm 优先，react/soul 兜底。
  *
- * 输出叙事（非纯数字）或 null（无任何数据源可用，fail-open）。
+ * ≤200 字硬约束（LANDSCAPE_MAX_CHARS，定稿 v2 §四-2）。
+ * fail-open：/landscape 缺失（landscapeData null）→ 回退旧行为
+ * （react/soul 状态派生叙事），保证无景观数据时仍可注入。
  */
-function buildLandscapeNarrative(reactData, soulData) {
+function buildLandscapeNarrative(reactData, soulData, landscapeData) {
   const react =
     reactData && typeof reactData === "object" && reactData.reaction
       ? reactData.reaction
@@ -530,49 +558,89 @@ function buildLandscapeNarrative(reactData, soulData) {
     soulData && typeof soulData === "object" && soulData.lms_state
       ? soulData.lms_state
       : {};
-  // 阶段 1 弥散态专项：探测型注入分支（报数，不编故事）
-  const entropyRatio =
-    typeof react.entropy_ratio === "number"
-      ? react.entropy_ratio
-      : (typeof st.entropy_ratio === "number" ? st.entropy_ratio : null);
+
+  // /landscape 读数（阶段 2 P1-1 主缺口）：结构确认自 api/server.py
+  // get_landscape：{num_nodes, activation:{entropy,entropy_norm,active_nodes,
+  // top_activated:[{node,sigma}]}, energy:{...}}（curl 实测，八荣八耻）。
+  const land =
+    landscapeData && typeof landscapeData === "object" && landscapeData.landscape
+      && typeof landscapeData.landscape === "object" ? landscapeData.landscape : null;
+  const landAct = land && land.activation && typeof land.activation === "object"
+    ? land.activation : null;
+
+  // 熵比：/landscape entropy_norm 优先（弥散态闸门），react/soul 兜底
+  const entropyRatio = typeof landAct?.entropy_norm === "number"
+    ? landAct.entropy_norm
+    : (typeof react.entropy_ratio === "number"
+        ? react.entropy_ratio
+        : (typeof st.entropy_ratio === "number" ? st.entropy_ratio : null));
+
+  // 弥散态降级路径（R4）：entropy > 0.98 → 探测型注入（读数 + [异常]）
   if (entropyRatio !== null && entropyRatio >= DIFFUSE_ENTROPY_RATIO) {
-    const probe = buildDiffuseProbe(react, st, entropyRatio);
-    if (probe) return probe;
+    const probe = buildDiffuseProbe(react, st, entropyRatio, landscapeData);
+    if (probe) {
+      // ≤200 字硬约束同样适用于探测段（定稿 v2 §四-2：景观叙事 ≤200）
+      if (probe.length > LANDSCAPE_MAX_CHARS) {
+        return `${probe.slice(0, LANDSCAPE_MAX_CHARS)}…`;
+      }
+      return probe;
+    }
   }
 
   const clauses = [];
 
-  // 1) 解读段（自然语言，前 2 句）——"什么在激活"的主体叙事
-  const interp =
-    reactData && typeof reactData.interpretation === "string"
-      ? reactData.interpretation.trim()
-      : "";
-  const interpClauses = interp.split("｜").map((s) => s.trim()).filter(Boolean);
-  if (interpClauses.length > 0) {
-    clauses.push(interpClauses.slice(0, 2).join("｜"));
-  } else {
-    // 解读段缺席（/react 失败/降级）→ 从状态数字派生基础叙事（fail-open）
-    const entropyRatio = typeof react.entropy_ratio === "number"
-      ? react.entropy_ratio
-      : (typeof st.entropy_ratio === "number" ? st.entropy_ratio : null);
-    if (entropyRatio !== null) {
+  // ── 阶段 2 P1-1：/landscape 读数派生（禁止文学化）──
+  if (landAct && Array.isArray(landAct.top_activated) && landAct.top_activated.length > 0) {
+    const top = landAct.top_activated
+      .map((t) => (t && typeof t.sigma === "number") ? Math.abs(t.sigma) : 0)
+      .filter((v) => v > 1e-9);
+    if (top.length > 0) {
+      // 主导盆地数：|σ| ≥ 0.5（B 级后新尺度）
+      const dominant = top.filter((v) => v >= 0.5).length;
+      // σ 层级：σmax + 峰差 Δ（top1−top2）+ sat 派生
+      const sigmaMax = Math.max(...top);
+      const sigma2 = top.length > 1 ? Math.max(...top.slice(1)) : 0;
+      const peakGap = sigmaMax - sigma2;
+      const sat = sigmaMax < 0.9 ? "0.00" : ">0"; // σmax<0.9 ⇒ 无饱和（B 级后）
+      const numNodes = typeof land.num_nodes === "number" ? land.num_nodes : null;
+      const active = typeof landAct.active_nodes === "number" ? landAct.active_nodes : null;
+      const topo = (active !== null && numNodes !== null)
+        ? `激活${active}/${numNodes}` : null;
+      const entropyBit = typeof landAct.entropy_norm === "number"
+        ? `熵比${landAct.entropy_norm.toFixed(2)}` : null;
       clauses.push(
-        entropyRatio >= 0.8 ? "高唤醒·多模式扩散"
-          : entropyRatio >= 0.4 ? "中等激活"
-            : "低唤醒·单模式聚焦",
+        [
+          `主导盆地${dominant}`,
+          topo,
+          entropyBit,
+          `σmax${sigmaMax.toFixed(2)}·Δ${peakGap.toFixed(2)}·sat${sat}`,
+        ].filter(Boolean).join("｜"),
       );
     }
+  } else if (entropyRatio !== null) {
+    // /landscape 缺失（fail-open）→ 回退旧行为：状态数字派生（不文学化）
+    clauses.push(
+      entropyRatio >= 0.8 ? "高唤醒·多模式扩散"
+        : entropyRatio >= 0.4 ? "中等激活"
+          : "低唤醒·单模式聚焦",
+    );
   }
 
-  // 2) 惊讶涨落方向（解读段通常不覆盖；z 分优先，绝对等级兜底）
+  // 漂移读数：惊讶（B 级后 ~20 量级，报数）+ z 方向（尺度无关）
+  const surprise = typeof react.surprise === "number"
+    ? react.surprise
+    : (typeof st.last_surprise === "number" ? st.last_surprise : null);
   const surpriseZ = typeof react.surprise_z === "number" ? react.surprise_z : null;
-  if (surpriseZ !== null) {
-    clauses.push(surpriseZ > 1 ? "惊讶上升" : surpriseZ < -1 ? "惊讶回落" : "惊讶平稳");
-  } else if (typeof st.last_surprise === "number") {
-    clauses.push(st.last_surprise > 20 ? "惊讶偏高" : st.last_surprise > 5 ? "惊讶中等" : "惊讶偏低");
+  if (surprise !== null) {
+    const zdir = surpriseZ !== null
+      ? (surpriseZ > 1 ? "↑" : surpriseZ < -1 ? "↓" : "→")
+      : "";
+    clauses.push(`惊讶${surprise.toFixed(1)}${zdir}`);
+  } else if (surpriseZ !== null) {
+    clauses.push(surpriseZ > 1 ? "惊讶↑" : surpriseZ < -1 ? "惊讶↓" : "惊讶→");
   }
 
-  // 3) 目的稳定性
+  // 目的稳定性（读数）
   const coherence = typeof react.coherence === "number"
     ? react.coherence
     : (typeof st.purpose_coherence === "number" ? st.purpose_coherence : null);
@@ -581,7 +649,10 @@ function buildLandscapeNarrative(reactData, soulData) {
   }
 
   if (clauses.length === 0) return null;
-  return `景观:${clauses.join("｜")}`;
+  let out = `景观:${clauses.join("｜")}`;
+  // ≤200 字硬约束（定稿 v2 §四-2）
+  if (out.length > LANDSCAPE_MAX_CHARS) out = `${out.slice(0, LANDSCAPE_MAX_CHARS)}…`;
+  return out;
 }
 
 /**
@@ -793,8 +864,21 @@ export function loadRecentThoughts(maxItems = THOUGHTS_MAX_ITEMS) {
   }
 }
 
+// R7 灰度观测（C1：INJECTED len 分布 + 回魂段截断率）：thought 注入条数 /
+// 回魂段截断事件写日志（与 logMiss 同模式，日志失败绝不影响主流程）。
+function logThoughtInject(n) {
+  try {
+    appendFileSync(DEBUG_LOG_FILE, `[${new Date().toISOString()}] THOUGHT-INJECT n=${n}\n`);
+  } catch { /* 日志失败忽略：不引入新崩溃点 */ }
+}
+function logThoughtFallback(from, to) {
+  try {
+    appendFileSync(DEBUG_LOG_FILE, `[${new Date().toISOString()}] THOUGHT-FALLBACK ${from}->${to}\n`);
+  } catch { /* 日志失败忽略：不引入新崩溃点 */ }
+}
+
 /**
- * 按激活度取 1 条 thought（设计 §三-3；P1-4 预算重分配后 1 条/轮）。规则：
+ * 按激活度取 1-2 条 thought（设计 §三-3；R7 灰度 2026-08-16）。规则：
  *   - act = 双向 Jaccard（P1-2，见 thoughtActivation）；echo.flagged → ×0.5
  *     （防回声降权）；unresolved → +0.02（悬案连续性小幅加成——旧 0.05 是
  *     coverage 尺度标定，Jaccard 尺度下会把 0.02 的弱相关直接推过阈值，
@@ -802,9 +886,11 @@ export function loadRecentThoughts(maxItems = THOUGHTS_MAX_ITEMS) {
  *   - act < cfg.thoughtActivationMin → 不注入（激活度低则不注入）
  *   - P1-2：同文本 thought 精确去重（审计：两条相同文本 thought 同时
  *     0.069/0.069 入选，thought 行 217 字里约一半是重复内容）
+ *   - maxItems：R7 灰度上限（默认 THOUGHT_INJECT_MAX=2；buildSoulText 预算
+ *     闸门降级时传 1）
  * 返回 [{thought, act}]（按 act 降序）。
  */
-export function pickThoughts(query, thoughts, cfg) {
+export function pickThoughts(query, thoughts, cfg, maxItems = THOUGHT_INJECT_MAX) {
   if (!Array.isArray(thoughts) || thoughts.length === 0) return [];
   const min = Number.isFinite(cfg.thoughtActivationMin)
     ? cfg.thoughtActivationMin
@@ -823,12 +909,12 @@ export function pickThoughts(query, thoughts, cfg) {
   scored.sort((a, b) => b.act - a.act);
   return scored
     .filter((s) => s.act >= min)
-    .slice(0, Math.max(THOUGHT_INJECT_MIN, THOUGHT_INJECT_MAX));
+    .slice(0, Math.max(THOUGHT_INJECT_MIN, maxItems));
 }
 
 /** 组装 thought 注入行（≤THOUGHT_MAX_CHARS/条，1-2 条；无命中 → null）。 */
-export function buildThoughtLayer(query, thoughts, cfg) {
-  const picked = pickThoughts(query, thoughts, cfg);
+export function buildThoughtLayer(query, thoughts, cfg, maxItems = THOUGHT_INJECT_MAX) {
+  const picked = pickThoughts(query, thoughts, cfg, maxItems);
   if (picked.length === 0) return null;
   const bits = picked.map(({ thought }) => {
     let text = String(thought.text || "").trim().replace(/\s+/g, " ");
@@ -870,14 +956,18 @@ export function buildActionLayer(thought) {
 
 /**
  * 把 /soul 响应整理为【回魂】段（≤maxChars，默认 200）。
- * 阶段 1 六层：① 状态块 + ② 景观叙事 + ③ thought 占位 + 自述/最近（保留）。
+ * 阶段 1 六层：① 状态块 + ② 景观叙事 + ③ thought + 自述/最近（保留）。
+ * 阶段 2 P1-1：② 景观叙事真实读 /landscape（landscapeData 透传，读数派生）；
+ * ③ thought R7 灰度：1 条默认 + 余量升 2（预算闸门：2 条超 maxChars → 降 1 条）。
  * 格式：`[回魂] 自述:… / 状态:熵0.95 惊讶0.11 目的0.92 / 景观:… / thought:… / 最近:…`
  * 无有效字段/异常结构 → 返回 null。
  *
  * @param {object|null} reactData 体验层 A：/react 响应（可选）。在场时把
  *   记忆状态解读段扩权为景观叙事（设计 v1.1 §3.4：解读段放截断保活区，永不先截）。
+ * @param {object|null} landscapeData 阶段 2 P1-1：/landscape/{sid} 响应（可选）。
+ *   在场时景观叙事走读数派生（主导盆地/激活拓扑/σ 层级/漂移），缺失回退旧行为。
  */
-export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null, query = "", cfg = null, pickedThoughts = null) {
+export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null, query = "", cfg = null, pickedThoughts = null, landscapeData = null) {
   // data 为 null = 未启用/请求失败（原因已在 postJson 记 MISS），此处不重复记
   if (!data || typeof data !== "object") return null;
   const parts = [];
@@ -900,28 +990,37 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null,
   if (typeof st.turn_count === "number") stBits.push(`轮次${st.turn_count}`);
   if (stBits.length > 0) parts.push(`状态:${stBits.join(" ")}`);
 
-  // ② 景观叙事（解读段扩权，设计 v1.1 §三-2）：描述"当前记忆状态"——
-  //    什么在激活 / 惊讶涨落 / 目的稳定性（非纯数字，≤200 字预算内）。
-  //    /react 失败（reactData null）时退化为从 lms_state 派生（fail-open）。
-  const landscape = buildLandscapeNarrative(reactData, data);
+  // ② 景观叙事（阶段 2 P1-1：真实读 /landscape 读数派生，≤200 字；
+  //    /landscape 缺失 → 回退 react/soul 状态派生，fail-open）
+  const landscape = buildLandscapeNarrative(reactData, data, landscapeData);
   if (landscape) parts.push(landscape);
 
-  // ③ thought notes（阶段 2 思考链，2026-08-13）：按"与当前对话的激活度"
-  //    取 1-2 条（bigram 覆盖度；echo 降权、悬案加成）；未激活不注入。
-  //    cfg.thoughtEnabled=false 可整体关闭（灰度回滚开关）。
+  // ③ thought notes（阶段 2 思考链，2026-08-13；R7 灰度 2026-08-16）：
+  //    按"与当前对话的激活度"取 1 条默认 + 余量灰度升 2（bigram 覆盖度；
+  //    echo 降权、悬案加成）；未激活不注入。cfg.thoughtEnabled=false 可整体关闭。
   //    阶段 4：pickedThoughts 可选——buildMemoryContext 已算好激活结果时
-  //    直接复用（避免重复读 thoughts.jsonl + 重复打分），缺省回退自行挑选
-  //    （向后兼容旧调用方/测试）。
+  //    直接复用（避免重复读 thoughts.jsonl + 重复打分），缺省回退自行挑选。
+  //    R7 预算闸门（C1 观测点）：2 条使回魂段 >maxChars → 降为 1 条重建。
   const cfgT = cfg && typeof cfg === "object" ? cfg : {};
   if (cfgT.thoughtEnabled !== false && typeof query === "string" && query) {
-    const thoughtLine = buildThoughtLayer(
-      query,
-      Array.isArray(pickedThoughts)
-        ? pickedThoughts.map((p) => p.thought)
-        : loadRecentThoughts(),
-      cfgT,
-    );
-    if (thoughtLine) parts.push(thoughtLine);
+    const thoughts = Array.isArray(pickedThoughts)
+      ? pickedThoughts.map((p) => p.thought)
+      : loadRecentThoughts();
+    // 灰度：先尝试 2 条（THOUGHT_INJECT_MAX），超预算降 1 条
+    let thoughtLine = buildThoughtLayer(query, thoughts, cfgT, THOUGHT_INJECT_MAX);
+    if (thoughtLine) {
+      parts.push(thoughtLine);
+      const provisional = `[回魂] ${parts.join(" / ")}`;
+      if (provisional.length > maxChars) {
+        // R7 灰度降级：2 条超预算 → 1 条（回魂段永不先截，丢 thought 不丢状态）
+        parts.pop();
+        const oneLine = buildThoughtLayer(query, thoughts, cfgT, 1);
+        if (oneLine) parts.push(oneLine);
+        logThoughtFallback(2, 1);
+      } else {
+        logThoughtInject(thoughtLine.includes("｜") ? 2 : 1);
+      }
+    }
   }
 
   // 4. 最近（沙漏最新记忆）：去重 + 最多 2 条（放 thought 之后=截断时先丢）
@@ -973,30 +1072,42 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
     return null;
   }
 
-  // ④ 焦点记忆：3-5 条（Cowan 4±1），精确去重（滤伪相关：同文不重复注入）
+  // ④ 焦点记忆：3-5 条（Cowan 4±1），六层衔接加权（R4，定稿 v2 §四-3）：
+  //    “相关性×trust×景观激活”加权取舍（滤伪相关——Power of Noise）。
+  //    相关性 = scores.total（glue 协同分）；trust = ⚠️置信 标注（parseConfidenceTag，
+  //    无标注默认 1.0）；景观激活 = scores.lms_activation（LMS 激活加权分量）。
+  //    加权分 = relevance × trust × landscape_activation，降序取前 3-5 条。
+  //    精确去重（同文不重复注入）。缺分字段的条目用 1.0 中性值（fail-open 不误杀）。
   const items = [];
   const seenTexts = new Set();
   for (const it of results) {
     const text = typeof it?.text === "string" ? it.text.trim().replace(/\s+/g, " ") : "";
     if (!text || seenTexts.has(text)) continue;
     seenTexts.add(text);
+    const relevance = typeof it?.scores?.total === "number" ? it.scores.total : 1.0;
+    const trust = parseConfidenceTag(text) ?? 1.0;
+    const landscapeAct = typeof it?.scores?.lms_activation === "number"
+      ? it.scores.lms_activation : 1.0;
     items.push({
       text,
       origin: typeof it?.origin === "string" && it.origin ? it.origin : "",
       score: typeof it?.scores?.total === "number" ? it.scores.total : null,
+      weight: relevance * trust * landscapeAct,
     });
-    if (items.length >= FOCUS_MAX_ITEMS) break;
   }
-  if (items.length === 0) {
+  // 六层衔接加权（R4）：按 相关性×trust×景观激活 降序取舍（滤伪相关）
+  items.sort((a, b) => b.weight - a.weight);
+  const picked = items.slice(0, FOCUS_MAX_ITEMS);
+  if (picked.length === 0) {
     logMiss("recall-no-usable-text"); // P0-1：命中条目均无可注入文本
     return null;
   }
 
-  const lines = [`[记忆注入] 焦点记忆 ${items.length} 条（按"${String(query).slice(0, 60)}"激活加权召回）：`];
-  for (const [i, it] of items.entries()) {
-    // 来源 + 置信度标注（质疑层基础）：[origin·分total]；无分时仅标来源
+  const lines = [`[记忆注入] 焦点记忆 ${picked.length} 条（按"${String(query).slice(0, 60)}"激活加权召回）：`];
+  for (const [i, it] of picked.entries()) {
+    // 来源 + 置信度标注 + 加权分（R4 可观测）：[origin·分total·权w]；无分时仅标来源
     const meta = it.origin
-      ? `[${it.origin}${it.score !== null ? `·分${it.score.toFixed(2)}` : ""}]`
+      ? `[${it.origin}${it.score !== null ? `·分${it.score.toFixed(2)}` : ""}·权${it.weight.toFixed(2)}]`
       : "";
     lines.push(`${i + 1}. ${meta} ${it.text}`);
   }
@@ -1149,12 +1260,14 @@ export async function buildMemoryContext(prompt, pluginConfig) {
   inflight = true;
   lastCallAt = now;
   try {
-    // 体验层 A：三路并行——/react（实时反应，k=0 轻量）+ /soul（回魂，保留）
-    // + /recall（记忆块，保留）。任一失败各自 fail-open，不拖慢其他路。
-    const [reactData, soulData, recallData] = await Promise.all([
+    // 阶段 2 P1-1：四路并行——/react（实时反应，k=0 轻量）+ /soul（回魂，保留）
+    // + /recall（记忆块，保留）+ /landscape（景观读数，P1-1 主缺口修复）。
+    // 任一失败各自 fail-open，不拖慢其他路。
+    const [reactData, soulData, recallData, landscapeData] = await Promise.all([
       fetchReact(cfg, query),
       cfg.soulEnabled ? fetchSoul(cfg) : Promise.resolve(null),
       recallFromGlue(query, cfg),
+      cfg.landscapeEnabled ? fetchLandscape(cfg) : Promise.resolve(null),
     ]);
 
     // 阶段 4：激活 thought 一次挑选、两处复用（③ thought 层 + ⑥ 行动层）——
@@ -1168,8 +1281,9 @@ export async function buildMemoryContext(prompt, pluginConfig) {
       pickedThought = picked.length > 0 ? picked[0].thought : null;
     }
     // 【回魂】段（≤soulMaxChars），优先于记忆块；解读段经 reactData 追加；
-    // 阶段 2：query + cfg 透传（③ thought notes 激活度筛选需要）
-    const soulText = buildSoulText(soulData, cfg.soulMaxChars, reactData, query, cfg, picked);
+    // 阶段 2：query + cfg 透传（③ thought notes 激活度筛选需要）；
+    // P1-1：landscapeData 透传（② 景观叙事真实读 /landscape 读数派生）。
+    const soulText = buildSoulText(soulData, cfg.soulMaxChars, reactData, query, cfg, picked, landscapeData);
     // P1-4（审计 2026-08-14）：注入预算余量保护。旧实现按 maxChars 顶格执行
     // （实测 798/800，余量 2 字——回魂段 301 必截、最近记忆必丢）。现在：
     //   ① 总量按 maxChars-COMPOSE_MARGIN=760 执行（40 字安全余量）；
