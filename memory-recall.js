@@ -18,7 +18,7 @@
 //   注入块 ≤800 字硬约束。
 //
 // 阶段 2 步骤 4（P1-3 注入时验证链，2026-08-16，定稿 v2 §六；P1 三根因修复
-// 2026-08-16 审计后，验证链默认关闭（verifyChainEnabled===true 才启用））：
+// 2026-08-16 重审正式通过后灰度开启（verifyChainEnabled 默认 true，可配置关））：
 //   高 stakes 可操作化（冲突检测 + STAKE_TOPICS 白名单）→ CoVe 轻量验证链
 //   （草稿→独立验证→修正；独立验证防伪独立：端点/query/批次三方不同源）→
 //   确认（hRepro&&eRepro + isContradictionPair 矛盾判定）写 [doubt] conflict
@@ -151,7 +151,10 @@ const VERIFY_NUM_DIFF_THRESHOLD = (() => {
 // 的否定，远处否定不算——防“双方存在”类伪矛盾，见 isContradictionPair 注释）。
 const VERIFY_NEGATION_NEAR_CHARS = 3;
 const HIGH_TRUST_MIN = 0.5;             // 高信任判定：无 ⚠️标注（默认 1.0）或标注 ≥0.5
-const VERIFY_DOUBT_PREFIX_RE = /^\s*\[doubt\]/i; // 防回声：系统事件非验证候选
+const VERIFY_DOUBT_PREFIX_RE = /^\s*\[doubt(?:-[a-z]+)?\]/i; // 防回声：系统事件非验证候选。
+// [doubt] conflict 事件 + [doubt-supersedes] 证伪标记（旧污染条目梦期改写产物）均排除——
+// 2026-08-16 灰度开启时真实数据实证：supersedes 标记内含原文本 → 必然 overlap →
+// 占 stake 6/35（17%）制造验证链噪音、污染 contradiction=false 灰度指标。
 
 // ----------------------------------------------------------------------
 // 召回L1-a（2026-08-11）：query 净化 —— 复刻 openclaw 自带 stripInboundMetadata
@@ -370,10 +373,10 @@ export function resolveConfig(pluginConfig) {
     // 全走静态默认（fail-open 兼容路径）。
     lmsRecallConsistencyEnabled: cfg.lmsRecallConsistencyEnabled !== false,
     // P1-3（阶段 2 步骤 4）：verifyChainEnabled——注入时验证链开关。
-    // P0 止血（2026-08-16 21:40）：假冲突污染主会话（2 条真实记忆被标 labile），
-    // P1 修复（overlapMatch 子串碰撞/hRepro&&eRepro 不辨矛盾/幂等竞态）前默认关闭；
-    // 恢复：cfg.verifyChainEnabled !== false（经插件配置开启）或 P1 修复后改回。
-    verifyChainEnabled: cfg.verifyChainEnabled === true,
+    // 灰度开启（2026-08-16，P1 三根因修复重审正式通过后，dandan 拍板）：
+    // 默认开（cfg.verifyChainEnabled !== false）；快速回滚 = 插件配置一行
+    // verifyChainEnabled:false（a8fe757 曾默认关止血，此处恢复完整功能）。
+    verifyChainEnabled: cfg.verifyChainEnabled !== false,
     thoughtActivationMin: Number.isFinite(cfg.thoughtActivationMin)
       ? Math.max(0, Math.min(1, cfg.thoughtActivationMin))
       : 0.05,
@@ -1376,8 +1379,8 @@ function logScoreDoubt(mode, trust, before, after, annotated, snippet) {
 //     ——方向性相反/数值差异超阈值/否定词极性翻转三选一才登记冲突。
 //   根因 3（60s 幂等竞态）：乐观窗口 + verifyIngested 查重（/recall 只读）+ 
 //     done 永久幂等 + attempts 封顶——超时后先查重再判“未写入”。
-//   验证链默认关闭（verifyChainEnabled 默认 false，P0 止血 + P1 修复后保持，
-//     四妹重审通过才开）。
+//   验证链默认开启（verifyChainEnabled 默认 true——P1 三根因修复重审正式通过
+//     后灰度开启；快速回滚 = 插件配置 verifyChainEnabled:false 一行）。
 //
 // 零开销契约：无高 stakes → 零 HTTP、零日志、注入面零改动（纯函数判定）。
 
@@ -1933,16 +1936,27 @@ export async function runVerifyChain(cfg, userQuery, results) {
         // 路径；结果入 VERIFY-WRITE 日志，written/reason/id 可查——P1 修复
         // 根因 3：写前查重 + 乐观窗口，超时≠未写入）
         writeDoubtConflict(cfg, s.candidate.text)
-          .then((res) => logVerify("WRITE", {
-            endpoint: "/feed", kind: "conflict",
-            ok: Boolean(res && res.written),
-            reason: res && res.reason,
-            id: res && res.id !== undefined && res.id !== null ? res.id : "-",
-            candidate: s.candidate.text,
-          }))
+          .then((res) => {
+            // 灰度观测（重审建议落地，2026-08-16）：写侧 dedup 分桶
+            // written/dedup/rejected 三桶可机器统计（grep 'VERIFY-WRITE' |
+            // grep -o 'bucket=[a-z]*' | sort | uniq -c）；rejected = 写失败/
+            // 超时/查重不可考跳过（未写出）。阈值预案：dedup 异常 → 回滚。
+            const reason = res && res.reason ? res.reason : "unknown";
+            const bucket = reason === "written" ? "written"
+              : reason.startsWith("dedup") ? "dedup"
+              : "rejected";
+            logVerify("WRITE", {
+              endpoint: "/feed", kind: "conflict",
+              ok: Boolean(res && res.written),
+              reason,
+              bucket,
+              id: res && res.id !== undefined && res.id !== null ? res.id : "-",
+              candidate: s.candidate.text,
+            });
+          })
           .catch(() => logVerify("WRITE", {
             endpoint: "/feed", kind: "conflict", ok: false,
-            reason: "unexpected-error",
+            reason: "unexpected-error", bucket: "rejected",
             candidate: s.candidate.text,
           }));
       }

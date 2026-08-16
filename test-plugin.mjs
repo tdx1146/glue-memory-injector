@@ -979,6 +979,17 @@ ok("P1-3fix 根因2（灵魂指标②）：语义互补条目不判冲突（双�
     0,
     "互补对 → 无 stake",
   );
+  // 灰度开启实证（2026-08-16）：[doubt-supersedes] 证伪标记（系统事件家族）
+  // 同样不参与候选/参照——标记内含原文本 → 必然 overlap → 真实数据占 stake
+  // 6/35（17%）纯噪音；VERIFY_DOUBT_PREFIX_RE 已扩展覆盖（[doubt] 与 [doubt-*]）
+  assert.equal(
+    detectHighStakes([
+      { id: "s", text: "[doubt-supersedes] 原记忆被证伪: dandan：你们都完全跑偏了，动用所有搜索手段重新搜索记忆" },
+      { id: "o", text: "dandan：你们都完全跑偏了，动用所有搜索手段重新搜索记忆" },
+    ], {}).length,
+    0,
+    "supersedes 标记条目不产生 stake（防回声防线 1 覆盖系统事件家族）",
+  );
 });
 
 ok("P1-3fix 根因2（灵魂指标③）：真矛盾条目仍触发（方向相反/数值冲突/否定翻转）", () => {
@@ -1003,8 +1014,9 @@ ok("P1-3fix 根因2（灵魂指标③）：真矛盾条目仍触发（方向相�
   assert.equal(detectHighStakes(results, {}).length, 1, "时间戳剥离后真实取值冲突仍产生 stake");
 });
 
-ok("P1-3fix 默认关：verifyChainEnabled 默认 false（P0 止血 a8fe757 + P1 修复后保持，四妹重审通过才开）", () => {
-  assert.equal(resolveConfig({}).verifyChainEnabled, false, "无配置 → 默认关");
+ok("P1-3fix 默认开：verifyChainEnabled 默认 true（P1 三根因修复重审正式通过后灰度开启；可配置关闭=快速回滚）", () => {
+  assert.equal(resolveConfig({}).verifyChainEnabled, true, "无配置 → 默认开（灰度开启）");
+  assert.equal(resolveConfig({ verifyChainEnabled: false }).verifyChainEnabled, false, "显式 false → 关（快速回滚路径）");
   assert.equal(resolveConfig({ verifyChainEnabled: true }).verifyChainEnabled, true, "显式 true → 开");
 });
 
@@ -1106,7 +1118,7 @@ await okAsync("P1-3fix 根因2（全链）：hRepro&&eRepro 命中但语义互�
       glueUrl: `http://127.0.0.1:${port}`,
       lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
       landscapeSid: "main",
-      verifyChainEnabled: true, // 显式开启验证链（默认关）
+      verifyChainEnabled: true, // 显式开启验证链（默认已开，此处显式锁语义）
       minIntervalMs: 0,
       maxChars: 800,
     });
@@ -1127,8 +1139,8 @@ await okAsync("P1-3fix 根因2（全链）：hRepro&&eRepro 命中但语义互�
   }
 });
 
-await okAsync("P1-3fix 默认关（行为层）：无 verifyChainEnabled 配置 → 验证链零活动（P1-2 窄路径不受影响）", async () => {
-  const lmsState = { recallHits: 0, feedHits: 0 };
+await okAsync("P1-3fix 默认开（行为层）：无 verifyChainEnabled 配置 → 验证链默认运行（冲突确认 → 标注 + /feed 登记 + 写侧幂等）", async () => {
+  const lmsState = { recallHits: 0, feedHits: 0, feedBodies: [] };
   const lmsServer = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -1140,12 +1152,21 @@ await okAsync("P1-3fix 默认关（行为层）：无 verifyChainEnabled 配置 
       }
       if (req.method === "POST" && req.url.startsWith("/recall")) {
         lmsState.recallHits += 1;
+        const q = JSON.parse(body).query || "";
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ results: [] }));
+        // 验证批次路由：H 复现（8月15）→ 高一致未怀疑；E 复现（8月30）→ 可复现；
+        // 窄路径/写前查重（其他 query）→ 空（查重只认 [doubt] 前缀，不误判已摄入）
+        const out = q.includes("8月15")
+          ? [{ text: "用户生日P19B是8月15日", consistency: 0.9, adaptive_confidence: 0.9, doubt_verdict: false }]
+          : q.includes("8月30")
+            ? [{ text: "用户生日P19A是8月30日", consistency: 0.9, adaptive_confidence: 0.9, doubt_verdict: false }]
+            : [];
+        res.end(JSON.stringify({ results: out }));
         return;
       }
       if (req.method === "POST" && req.url.startsWith("/feed")) {
         lmsState.feedHits += 1;
+        lmsState.feedBodies.push(JSON.parse(body));
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "ok" }));
         return;
@@ -1161,19 +1182,32 @@ await okAsync("P1-3fix 默认关（行为层）：无 verifyChainEnabled 配置 
   ], { soul: null });
   try {
     _resetRateLimitForTest();
-    const text = await buildMemoryContext("测试默认关P19冲突", {
+    const text = await buildMemoryContext("测试默认开P19冲突", {
       glueUrl: `http://127.0.0.1:${port}`,
       lmsUrl: `http://127.0.0.1:${lmsServer.address().port}`,
       landscapeSid: "main",
       minIntervalMs: 0,
       maxChars: 800,
-      // 注意：无 verifyChainEnabled → 默认关（a8fe757 + P1 修复后保持）
+      // 注意：无 verifyChainEnabled → 默认开（P1 三根因修复重审通过后恢复；本测试锁定默认开）
     });
     assert.ok(text && text.includes("[记忆注入]"), "应注入");
-    assert.ok(!text.includes("[doubt] conflict"), `默认关 → 不标注，实际 ${text}`);
-    await new Promise((r) => setTimeout(r, 300));
-    assert.equal(lmsState.feedHits, 0, "默认关 → 零 /feed");
-    assert.equal(lmsState.recallHits, 1, `默认关 → 仅 P1-2 窄路径 1 次 /recall（无 V1/V2/查重），实际 ${lmsState.recallHits}`);
+    assert.ok(text.includes("[doubt] conflict"), `默认开 → 冲突确认应标注 [doubt] conflict，实际 ${text}`);
+    // [doubt] conflict 写 /feed（fire-and-forget，轮询确认）——默认开全链：
+    // TRIGGER→INDEP→RESULT(confirmed)→WRITE
+    const fed = await waitFor(() => lmsState.feedHits === 1);
+    assert.ok(fed, `应恰好 1 次 /feed 写出（默认开全链），实际 ${lmsState.feedHits}`);
+    assert.ok(
+      lmsState.feedBodies[0].text.startsWith("[doubt] conflict: 用户生日P19A是8月30日"),
+      `/feed 文本应为 [doubt] conflict 协议（剥 ⚠️标注），实际 ${lmsState.feedBodies[0].text}`,
+    );
+    // 独立验证 V1/V2（2 次）+ P1-2 窄路径（E 低信任 1 次）+ 写前查重（1 次）
+    assert.equal(lmsState.recallHits, 4, `默认开 → 验证 2 + 窄路径 1 + 写前查重 1 = 4 次 LMS /recall，实际 ${lmsState.recallHits}`);
+    await new Promise((r) => setTimeout(r, 150)); // 等 fire-and-forget 的 WRITE 日志落盘
+    const logs = readVerifyLogs("P19");
+    assert.ok(logs.some((l) => l.includes("VERIFY-TRIGGER") && l.includes("reason=conflict")), `应有 VERIFY-TRIGGER（草稿），实际 ${logs.join("\n")}`);
+    assert.ok(logs.some((l) => l.includes("VERIFY-INDEP") && l.includes("source=lms-direct-recall") && l.includes("hRepro=true") && l.includes("eRepro=true")), `应有 VERIFY-INDEP（独立验证源），实际 ${logs.join("\n")}`);
+    assert.ok(logs.some((l) => l.includes("VERIFY-RESULT") && l.includes("verdict=confirmed") && l.includes("contradiction=true")), `应有 VERIFY-RESULT confirmed contradiction=true，实际 ${logs.join("\n")}`);
+    assert.ok(logs.some((l) => l.includes("VERIFY-WRITE") && l.includes("ok=true") && l.includes("bucket=written")), `应有 VERIFY-WRITE ok=true bucket=written，实际 ${logs.join("\n")}`);
   } finally {
     server.close();
     lmsServer.close();
@@ -1234,6 +1268,10 @@ await okAsync("P1-1 集成：真实链路六层齐 + 总注入 ≤800 + 景观 �
     glueUrl: "http://127.0.0.1:19000",
     lmsUrl: "http://127.0.0.1:8190",
     landscapeSid: "main",
+    // 只读集成测试保护（默认开之后）：真实链路测试不得对活体 LMS 产生写副作用
+    // （验证链确认会写 /feed → mark_labile）；验证链写侧全链由 mock 测试覆盖
+    // （P13/P19），此处显式关闭以保持本测试的只读语义
+    verifyChainEnabled: false,
     minIntervalMs: 0,
     maxChars: 800,
   });
@@ -1379,7 +1417,10 @@ await okAsync("真实 /soul 返回完整回魂快照", async () => {
       typeof snap.lms_state.purpose_coherence === "number",
     "状态指标含 熵/惊讶/目的",
   );
-  assert.ok(Array.isArray(snap.recent) && snap.recent.length > 0, "recent 非空");
+  // recent 非空是环境态（沙漏侧条目可能全为巡检/心跳噪音，被 _filter_soul_noise
+  // 过滤后为空——LMS 重启/记忆轮换后实测为空）→ 只锁结构契约（数组 + 条目字段），
+  // 不锁内容非空（防环境 flake；本测试核心 = 真实 /soul 端点结构 + 回魂段组装）
+  assert.ok(Array.isArray(snap.recent), "recent 为数组");
   for (const r of snap.recent) assert.equal(typeof r.text, "string");
   // 回魂段组装
   const soulText = buildSoulText(snap, 300);
@@ -1853,7 +1894,7 @@ assert.ok(agentEndHook, "应注册 agent_end（写侧，S2-1）");
 assert.equal(agentEndHook.opts.timeoutMs, 30000, "agent_end 预算 30s（runner 默认，源码实证）");
 // 用真实 glue_server（只读）驱动读侧 handler，验证返回结构
 const result = await bpbHook.handler(
-  { prompt: "帮我回忆总线工程进度", context: { pluginConfig: {} } },
+  { prompt: "帮我回忆总线工程进度", context: { pluginConfig: { verifyChainEnabled: false } } },
   {},
 );
 assert.ok(result === undefined || (result && typeof result.prependContext === "string"),
