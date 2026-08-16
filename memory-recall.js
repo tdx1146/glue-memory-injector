@@ -16,12 +16,28 @@
 //   ④焦点记忆 3-5 条（Cowan 4±1，滤伪相关，带来源+置信度标注） ⑤质疑层 ⑥行动层
 //     （阶段 4 已实现：激活 thought 的行动意向四问 + 分级；只展示不执行）
 //   注入块 ≤800 字硬约束。
-//   数据源缺口（阶段 1 记录）：attractor.get_landscape() 无 HTTP 端点——阶段 2
-//   已新增 LMS GET /landscape/{sid}（只读、fail-open，见 api/server.py）。
+//
+// 阶段 2 步骤 2（P1-1 完整落地，2026-08-16，定稿 v2 §四）：
+//   ②景观叙事主缺口修复：直调 LMS GET /landscape/{sid}（端点已存在，只读
+//     fail-open）→ 读数派生叙事（主导盆地数/激活拓扑/σmax·sat/熵比/惊讶漂移），
+//     禁止文学化（B 级后新尺度：surprise ~20 量级、σ 层级出现、sat 0.88→0.00）；
+//     弥散态（entropy > 0.98）走探测型注入（读数 + [异常] 标记）——R4 降级路径。
+//   ③thought：1 条默认 + 余量灰度升 2（R7；C1 观测：INJECTED len 分布 + 回魂段截断率）。
+//   ④焦点记忆六层衔接加权：相关性×trust×景观激活 取舍（R4，滤伪相关——Power of Noise）。
+//     数据链路：插件直调 127.0.0.1:8190（同主机，零 glue 改动——任务书首选直调）。
 
 import { appendFileSync, readFileSync } from "node:fs";
 
 const GLUE_DEFAULT_URL = "http://127.0.0.1:19000";
+// P1-1（阶段 2 步骤 2）：景观叙事直调 LMS /landscape/{sid}——插件与 LMS 同主机
+// （127.0.0.1:8190），直调零 glue 改动（任务书授权：首选直调）；只读 fail-open。
+const LMS_DEFAULT_URL = "http://127.0.0.1:8190";
+// /landscape 快路径：同 /soul（附加价值，宁可放弃也不拖慢注入）。
+const LANDSCAPE_TIMEOUT_MS = 4000;
+// 景观叙事 ≤200 字硬约束（定稿 v2 §四-2）。
+const LANDSCAPE_MAX_CHARS = 200;
+// 插件无 sid 概念；glue LMSAdapter 默认 session_id="main"，保持一致。
+const LANDSCAPE_SID = "main";
 // P0-1 止血：单次 HTTP 超时 4000 → 15000。慢后端（跨机 bge-m3 向量 / LMS /recall）
 // 在 hook 15s 预算内允许更充分等待，此前 4s 掐死导致注入频繁静默 MISS。
 const FETCH_TIMEOUT_MS = 15000;
@@ -59,10 +75,11 @@ const THOUGHT_MAX_CHARS = 60;    // 注入面摘要（全文在 thoughts.jsonl�
 // 对 90 字形态 0.0521、对 60 字前缀仅 0.028——注入内容（≤60）是评分窗
 // （≤90）的前缀，不存在“注入未评分内容”的错配）。
 const THOUGHT_ACTIVATION_CHARS = 90;
-// P1-4：注入条数 1-2 → 1（预算纪律：2 条 × 60 字 + 主题 + 分隔符 ≈ 140 字，
-// 叠加自述/状态/景观后回魂段仍会超 300 截断，丢「最近」；1 条 ≈ 70 字保底）。
-const THOUGHT_INJECT_MIN = 1;    // 1 条（P1-4 预算重分配后）
-const THOUGHT_INJECT_MAX = 1;
+// R7（定稿 v2 §四-4）：1 条默认 + 余量灰度升 2。预算闸门在 buildSoulText
+// （2 条使回魂段 >maxChars → 降 1 条重建，回魂段永不先截）；C1 观测点 =
+// INJECTED len 分布（index.js 已记）+ 回魂段截断率（SOUL-TRUNC 日志）。
+const THOUGHT_INJECT_MIN = 1;    // 默认 1 条（保底）
+const THOUGHT_INJECT_MAX = 2;    // 灰度上限（预算余量时升 2）
 // P1-4（审计 2026-08-14）：注入预算余量保护——总量按 800-40=760 执行，
 // 任何字数波动不再触发压线截断（旧实现 798/800，余量 2 字）。
 const COMPOSE_MARGIN = 40;
@@ -270,6 +287,12 @@ export function resolveConfig(pluginConfig) {
     soulMaxChars: Number.isFinite(cfg.soulMaxChars)
       ? Math.max(100, Math.min(800, Math.floor(cfg.soulMaxChars)))
       : SOUL_MAX_CHARS,
+    // P1-1（阶段 2 步骤 2）：景观叙事直调 LMS /landscape/{sid}。lmsUrl 可配
+    // （默认 127.0.0.1:8190）；landscapeSid 默认 main（与 glue LMSAdapter 一致）。
+    lmsUrl: typeof cfg.lmsUrl === "string" && cfg.lmsUrl ? cfg.lmsUrl : LMS_DEFAULT_URL,
+    landscapeSid: typeof cfg.landscapeSid === "string" && cfg.landscapeSid
+      ? cfg.landscapeSid : LANDSCAPE_SID,
+    landscapeEnabled: cfg.landscapeEnabled !== false,
     // 阶段 2 思考链：thought 注入开关 + 激活度阈值（默认 0.05≈共享 ~8 字
     // 片段=真实主题关联；阈值无文献【待灰度】，灰度期观测定参）
     thoughtEnabled: cfg.thoughtEnabled !== false,
@@ -370,6 +393,34 @@ export async function fetchSoul(cfg) {
   return postJson(`${cfg.glueUrl}/soul`, { limit: 3, recent_n: 3 }, SOUL_TIMEOUT_MS, "soul");
 }
 
+/**
+ * 直调 LMS GET /landscape/{sid}（阶段 2 P1-1 主缺口修复，2026-08-16）。
+ * 只读端点无副作用；任何异常/超时/非 2xx 返回 null（fail-open）。
+ * 数据链路：插件直调 127.0.0.1:8190（同主机）——零 glue 改动（任务书首选直调）；
+ * /landscape 不存在会话时返回空结构不 404（服务端只读语义，见 api/server.py）。
+ * sid 默认 "main"（与 glue LMSAdapter session_id="main" 一致）。
+ */
+export async function fetchLandscape(cfg) {
+  const url = `${cfg.lmsUrl}/landscape/${encodeURIComponent(cfg.landscapeSid)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LANDSCAPE_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, { signal: controller.signal });
+    if (!resp.ok) {
+      // P0-1：非 2xx 是重要信号，不得静默
+      logMiss(`landscape-non-2xx status=${resp.status} url=${url}`);
+      return null;
+    }
+    return await resp.json();
+  } catch (err) {
+    const why = err && err.name === "AbortError" ? "timeout" : "network-error";
+    logMiss(`landscape-${why} url=${url} timeoutMs=${LANDSCAPE_TIMEOUT_MS}`);
+    return null; // 网络错误 / 超时 / JSON 解析失败 → fail-open
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ── 阶段 1 弥散态专项（2026-08-16，v1.2 §四）：探测型注入 ──
 // 弥散态下“激活主题叙事”是零信息套话（3.08 教训：叙事型适配会鼓励
 // “弥散态是结晶前的东西”类空话）。改报可验证读数 + 显式异常标记：
@@ -382,7 +433,8 @@ export async function fetchSoul(cfg) {
 // 对齐系统 entropy_high_threshold=0.9 之上沿，防抖动）。
 const DIFFUSE_ENTROPY_RATIO = (() => {
   const raw = Number(process.env.DIFFUSE_ENTROPY_RATIO ?? "");
-  return Number.isFinite(raw) && raw > 0 && raw < 1 ? raw : 0.95;
+  // 定稿 v2 §四-3 / 任务书：entropy > 0.98 走探测型注入（R4 弥散态降级）。
+  return Number.isFinite(raw) && raw > 0 && raw < 1 ? raw : 0.98;
 })();
 
 /**
