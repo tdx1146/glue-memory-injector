@@ -40,8 +40,11 @@ import { appendFileSync, readFileSync } from "node:fs";
 
 const GLUE_DEFAULT_URL = "http://127.0.0.1:19000";
 // P1-1（阶段 2 步骤 2）：景观叙事直调 LMS /landscape/{sid}——插件与 LMS 同主机
-// （127.0.0.1:8190），直调零 glue 改动（任务书授权：首选直调）；只读 fail-open。
-const LMS_DEFAULT_URL = "http://127.0.0.1:8190";
+// （127.0.0.1:8191），直调零 glue 改动（任务书授权：首选直调）；只读 fail-open。
+// [2026-08-30 修复] V1 LMS :8190 已停用（四妹 V2 切换，agentos-v2/lms-api 监听 :8191）。
+// 旧端口死等 LANDSCAPE_TIMEOUT_MS×N 会阻塞网关事件循环（实测 event_loop_delay 2s、
+// models.list 4.7s、子代理启动 19.6s → UI 模型栏空、子AI「已停止」）。env 可覆盖。
+const LMS_DEFAULT_URL = process.env.LMS_URL || "http://127.0.0.1:8191";
 // /landscape 快路径：同 /soul（附加价值，宁可放弃也不拖慢注入）。
 const LANDSCAPE_TIMEOUT_MS = 4000;
 // 景观叙事 ≤200 字硬约束（定稿 v2 §四-2）。
