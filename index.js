@@ -1,5 +1,17 @@
 // index.js — OpenClaw 插件入口：glue-memory-injector
 //
+// ⚠️【双机制共存警告 2026-09-01 dandan 指令——后来者先读这段再改】：
+//   LMS 记忆注入有两套独立插件跑在不同运行时，**本插件 ≠ dsh-lms-memory**：
+//   ① 本插件 = **OpenClaw gateway 运行时**（~/.openclaw/plugins/），
+//      before_prompt_build 钩子 → 返回 prependContext 拼进 prompt →
+//      **GUI 不显示**（只有模型看到）。改动需重启 OpenClaw gateway。
+//   ② dsh-lms-memory = **DSH web 运行时**（agentos-v2/dsh-plugins/lms-memory +
+//      ~/.dsh/profiles/web/node_modules/dsh-lms-memory/），agent/pre-step 钩子
+//      → append 可见 user 消息 → **GUI 会话可见**（dandan 在 DSH 里看到的注入）。
+//   判断改的是哪个：看目录（本插件在 .openclaw/plugins/；dsh-lms-memory 在
+//      agentos-v2/dsh-plugins/ 或 .dsh/profiles/web/node_modules/）。
+//   不要跨目录重复实现同一功能；改前先 grep 对方目录确认没有同款逻辑。
+//
 // Hook：before_prompt_build（每轮模型调用前）
 //   - 返回 { prependContext: string } → OpenClaw 把该文本拼到用户消息之前
 //     （prependContext 契约类型为 string，见 plugin-sdk hook-before-agent-start.types.d.ts）
