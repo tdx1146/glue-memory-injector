@@ -67,10 +67,13 @@ const SOUL_MAX_CHARS = 300;      // 【回魂】段字数上限（2026-08-05 压
 // 体验层 A：限流轮轻量解读段上限（设计 v1.1 §3.4：≤150 字）
 const LIGHT_MAX_CHARS = 150;
 // 阶段 1 六层注入：焦点记忆容量（Cowan 2001 注意焦点 4±1 → 3-5 条）
-const FOCUS_MAX_ITEMS = 5;
+// [2026-09-09 dandan] 5→8：增加召回条数（对齐四妹 MEMORY_K，防上下文稀释）
+const FOCUS_MAX_ITEMS = 8;
 // 注入块 ≤800 字硬约束（lost-in-the-middle 2307.03172：短块内位置效应可控；
 // 超出走 composeContext 截断保活——[回魂] 段永不先截，先截记忆块尾部）
-const INJECT_MAX_CHARS = 800;
+// [2026-09-09 dandan] 800→12000：召回太短进上下文即被稀释，宁多勿短
+// （四妹侧 MAX_TEXT 已 12000，两边对齐；上下文 1M token 余量充足）
+const INJECT_MAX_CHARS = 12000;
 // ── 阶段 2 思考链：thought notes 接线（2026-08-13，设计 v1.1 §三-3）──
 // 读 thoughts.jsonl（思考链产物流）最近 N 条，按"与当前对话的激活度"
 // （字符 bigram 覆盖度，关键词法；设计允许 "embed 相似度或关键词"——注入
@@ -351,12 +354,12 @@ export function resolveConfig(pluginConfig) {
     glueUrl: typeof cfg.glueUrl === "string" && cfg.glueUrl ? cfg.glueUrl : GLUE_DEFAULT_URL,
     // 阶段 1：焦点记忆 3-5 条（Cowan 4±1 容量锚点），不再默认 8 条；
     // 显示层另有 FOCUS_MAX_ITEMS=5 硬顶兜底（即使配置 k>5）
-    k: Number.isFinite(cfg.k) ? Math.max(1, Math.min(20, Math.floor(cfg.k))) : 5,
+    k: Number.isFinite(cfg.k) ? Math.max(1, Math.min(20, Math.floor(cfg.k))) : 8,
     minIntervalMs: Number.isFinite(cfg.minIntervalMs)
       ? Math.max(0, Math.floor(cfg.minIntervalMs))
       : 2000,
     maxChars: Number.isFinite(cfg.maxChars)
-      ? Math.max(200, Math.min(4000, Math.floor(cfg.maxChars)))
+      ? Math.max(200, Math.min(20000, Math.floor(cfg.maxChars)))
       : INJECT_MAX_CHARS,
     soulEnabled: cfg.soulEnabled !== false,
     soulMaxChars: Number.isFinite(cfg.soulMaxChars)
