@@ -2082,7 +2082,7 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
     return null;
   }
 
-  const lines = [`[记忆注入] 焦点记忆 ${picked.length} 条（按"${String(query).slice(0, 60)}"激活加权召回）：`];
+  const lines = [`【系统注入 · 非用户消息】[记忆注入] 焦点记忆 ${picked.length} 条（按"${String(query).slice(0, 60)}"激活加权召回）：`];
   for (const [i, it] of picked.entries()) {
     // 来源 + 置信度标注 + 加权分（R4/P1-2 可观测）：[origin·分total·权score]；
     // 无分时仅标来源；R1 annotate 模式追加 [doubt] lowconf（降权模式不标注——
