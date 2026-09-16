@@ -2075,8 +2075,11 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
   }
   // 六层衔接加权（R4+P1-2）：score 降序取舍（滤伪相关）；低信任条目经降权沉底
   // /标注可见（审计 D 同法：高相关低信任沉底）
-  items.sort((a, b) => b.weight - a.weight);
-  const picked = items.slice(0, FOCUS_MAX_ITEMS);
+  // 自指回路止血（2026-09-16，四妹定位）: weight<=0 = 打分器已判无价值（如 [回魂]/self_ref
+  // 被压到 0 权），但它仍按"条数"占位 ⇒ 先剔，再按条数截断（判决与执行对齐）。
+  const usable = items.filter((it) => Number(it.weight) > 0);
+  usable.sort((a, b) => b.weight - a.weight);
+  const picked = usable.slice(0, FOCUS_MAX_ITEMS);
   if (picked.length === 0) {
     logMiss("recall-no-usable-text"); // P0-1：命中条目均无可注入文本
     return null;
