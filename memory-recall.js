@@ -653,7 +653,7 @@ function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
   if (surprise !== null) bits.push(`惊讶${surprise.toFixed(2)}`);
   if (mse !== null) bits.push(`mse${mse.toFixed(3)}`);
   if (precisionMean !== null) bits.push(`π̄${precisionMean.toFixed(3)}`);
-  const stateLine = `状态：不可判·熵饱和区（${bits.join(" / ")}）`;
+  const stateLine = `状态：不可判·熵饱和区（存量判据失效；见 09-18 量化）（${bits.join(" / ")}）`;
 
   // 读数行 2：漂移读数（可验证数字；缺字段不编）
   const driftBits = [];
@@ -683,9 +683,7 @@ function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
   // （/landscape activation、/react）当前无这些字段，故饱和区一律返回“不可判”，
   // 只保留读数做信息性标注。
   const diagLine =
-    "[信息性标注（非读数·存量判据失效）：熵在双极饱和区近似常数（判别力≈0），" +
-    "“熵高”不构成异常；替代判据（尺度不变/行为）：lam1_edge 变化 / lam2/lam1 / " +
-    "σ 符号一致率——当前注入源无此字段 ⇒ 本项不可判（见 2026-09-18 量化）]";
+    "[信息性标注：熵高≠异常；替代量 lam1_edge/lam2·lam1/σ符号一致率 注入源暂无⇒不可判]";
 
   const out = [stateLine, driftLine, gapLine, diagLine]
     .filter((x) => x !== null && typeof x === "string")
