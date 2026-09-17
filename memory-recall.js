@@ -31,7 +31,7 @@
 //   ②景观叙事主缺口修复：直调 LMS GET /landscape/{sid}（端点已存在，只读
 //     fail-open）→ 读数派生叙事（主导盆地数/激活拓扑/σmax·sat/熵比/惊讶漂移），
 //     禁止文学化（B 级后新尺度：surprise ~20 量级、σ 层级出现、sat 0.88→0.00）；
-//     弥散态（entropy > 0.98）走探测型注入（读数 + [异常] 标记）——R4 降级路径。
+//     熵饱和区（entropy > 0.98）走探测型读数注入（读数 + 不可判标注，非异常判定）——R4 降级路径。
 //   ③thought：1 条默认 + 余量灰度升 2（R7；C1 观测：INJECTED len 分布 + 回魂段截断率）。
 //   ④焦点记忆六层衔接加权：相关性×trust×景观激活 取舍（R4，滤伪相关——Power of Noise）。
 //     数据链路：插件直调 127.0.0.1:8190（同主机，零 glue 改动——任务书首选直调）。
@@ -573,31 +573,35 @@ export async function fetchLmsRecallConsistency(cfg, query) {
   }
 }
 
-// ── 阶段 1 弥散态专项（2026-08-16，v1.2 §四）：探测型注入 ──
-// 弥散态下“激活主题叙事”是零信息套话（3.08 教训：叙事型适配会鼓励
-// “弥散态是结晶前的东西”类空话）。改报可验证读数 + 显式异常标记：
+// ── 阶段 1 熵饱和区专项（2026-08-16，v1.2 §四；2026-09-18 判据更正）：探测型注入 ──
+// 熵饱和区下“激活主题叙事”是零信息套话（3.08 教训：叙事型适配会鼓励
+// “弥散态是结晶前的东西”类空话）。改报可验证读数 + 显式状态标注：
 //   报数，不编故事；信息量为零的文学化描述禁止进注入面。
-// 判据 3.09（v1.2 版）：“输出可验证的状态读数（具体数字/漂移量）+
-// 显式异常标记”——[异常] 标签即显式标记（弥散态标签是隐式标记）。
+// 判据 3.09（v1.2 版；2026-09-18 更正）：“输出可验证的状态读数（具体数字/
+// 漂移量）+ 显式状态标注”——标注语义 = 存量判据失效·不可判，不是 [异常]：
+//   熵在双极饱和区近似常数（健康、在分化的场 entropy_norm≈0.9997），“熵高⇒异常”
+//   必然误报（四妹 2026-09-18 量化：判别力 68.7% vs 0% 时熵 0.9997 vs 1.0，
+//   判别力=0 时熵反而更低）⇒ 本条只做信息性标注，不下异常结论。
 // 时序与定位（v1.2 §四）：本适配是行为层过渡补丁，不等同于状态场修复；
 // 若 A 级修复成功（entropy_norm 回落 0.5–0.9），本分支自然不触发，
 // 注入面恢复“激活主题叙事”。阈值 DIFFUSE_ENTROPY_RATIO（默认 0.95，
 // 对齐系统 entropy_high_threshold=0.9 之上沿，防抖动）。
 const DIFFUSE_ENTROPY_RATIO = (() => {
   const raw = Number(process.env.DIFFUSE_ENTROPY_RATIO ?? "");
-  // 定稿 v2 §四-3 / 任务书：entropy > 0.98 走探测型注入（R4 弥散态降级）。
+  // 定稿 v2 §四-3 / 任务书：entropy > 0.98 走探测型读数注入（R4 降级）。
+  // 2026-09-18：本分支保留为“读数上报”，不再自任“异常判定”（饱和区熵不可判别）。
   return Number.isFinite(raw) && raw > 0 && raw < 1 ? raw : 0.98;
 })();
 
 /**
- * 探测型注入（阶段 1 弥散态专项，v1.2 §四定稿；阶段 2 P1-1 增 /landscape 读数）
+ * 探测型注入（阶段 1 熵饱和区专项，v1.2 §四定稿；阶段 2 P1-1 增 /landscape 读数）
  * ——报数，不编故事。
  *
- * 弥散态下输出可验证的状态读数 + 显式 [异常] 标记（判据 3.09 v1.2 版：
- * “输出可验证的状态读数（具体数字/漂移量）+ 显式异常标记”）。
+ * 熵饱和区输出可验证的状态读数 + 显式状态标注（判据 3.09 v1.2 版，2026-09-18 更正：
+ * “输出可验证的状态读数（具体数字/漂移量）+ 显式状态标注”；标注 = 不可判，非 [异常]）。
  *
- * 样例（v1.2 §四）：
- *   状态：[异常] 弥散态（熵 0.9998 / 激活 256/256 / σ 单值 0.999）
+ * 样例（v1.2 §四；2026-09-18 更正后）：
+ *   状态：不可判·熵饱和区（熵 0.9998 / 激活 256/256 / σmax 0.999）
  *   漂移读数：entropy Δ=+0.0002 / 惊讶 9.96
  *   缺口：fok=0 / low_confidence=0
  *   [诊断标注（非读数）：惊讶度 mse 线性、方向无响应——供诊断/决策消费，
@@ -618,7 +622,7 @@ function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
   const r = react && typeof react === "object" ? react : {};
   const s = st && typeof st === "object" ? st : {};
 
-  // 读数行 1：状态读数（显式 [异常] 标记）
+  // 读数行 1：状态读数（显式状态标注：饱和区不可判，非 [异常]）
   const ent = typeof r.entropy_ratio === "number"
     ? r.entropy_ratio
     : (typeof s.entropy_ratio === "number" ? s.entropy_ratio : entropyRatio);
@@ -649,7 +653,7 @@ function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
   if (surprise !== null) bits.push(`惊讶${surprise.toFixed(2)}`);
   if (mse !== null) bits.push(`mse${mse.toFixed(3)}`);
   if (precisionMean !== null) bits.push(`π̄${precisionMean.toFixed(3)}`);
-  const stateLine = `状态：[异常] 弥散态（${bits.join(" / ")}）`;
+  const stateLine = `状态：不可判·熵饱和区（${bits.join(" / ")}）`;
 
   // 读数行 2：漂移读数（可验证数字；缺字段不编）
   const driftBits = [];
@@ -671,11 +675,17 @@ function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
   const gapLine = "缺口：fok/low_confidence 不可读（无 /soul 缺口字段）";
 
   // 诊断标注（非读数，供诊断/决策消费）：
-  // P2-7（审计 2026-08-16）：明确来源——本行是阶段 1 v1.2 存量判据文本，
-  // 非本轮读数派生（诚实标注不变，来源显式化）；完整派生诊断属后续步骤。
+  // P2-7（审计 2026-08-16）：明确来源——本行是存量判据文本，非本轮读数派生
+  // （诚实标注不变，来源显式化）；完整派生诊断属后续步骤。
+  // 2026-09-18 判据更正：熵高不再作为异常判据（饱和区熵近似常数、判别力≈0，
+  // 健康、在分化的场也恒踩阈值 ⇒ 必然误报）。可判的替代判据须为尺度不变/
+  // 行为量（lam1_edge 变化 / lam2/lam1 / σ 符号一致率）——本注入源
+  // （/landscape activation、/react）当前无这些字段，故饱和区一律返回“不可判”，
+  // 只保留读数做信息性标注。
   const diagLine =
-    "[诊断标注（非读数·存量判据）：惊讶度呈 mse 线性、方向响应退化——弥散态特征，" +
-    "行为层过渡补丁，不等同于状态场修复]";
+    "[信息性标注（非读数·存量判据失效）：熵在双极饱和区近似常数（判别力≈0），" +
+    "“熵高”不构成异常；替代判据（尺度不变/行为）：lam1_edge 变化 / lam2/lam1 / " +
+    "σ 符号一致率——当前注入源无此字段 ⇒ 本项不可判（见 2026-09-18 量化）]";
 
   const out = [stateLine, driftLine, gapLine, diagLine]
     .filter((x) => x !== null && typeof x === "string")
@@ -699,8 +709,9 @@ function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
  *   - 漂移读数：惊讶（/react reaction.surprise 或 /soul last_surprise，
  *     B 级后 ~20 量级）+ surprise_z 方向（>1 上升 / <-1 回落 / 平稳）
  *
- * 弥散态降级路径（R4/定稿 v2 §四-3）：entropy > 0.98（DIFFUSE_ENTROPY_RATIO）
- * → 探测型注入（buildDiffuseProbe：报数 + [异常] 标记），不输出激活主题叙事。
+ * 熵饱和区降级路径（R4/定稿 v2 §四-3）：entropy > 0.98（DIFFUSE_ENTROPY_RATIO）
+ * → 探测型读数注入（buildDiffuseProbe：报数 + 不可判标注，非异常判定），不输出激活主题叙事。
+ * 2026-09-18 更正：本分支只上报读数，不再把“熵高”当异常（饱和区熵不可判别）。
  * 阈值源：/landscape activation.entropy_norm 优先，react/soul 兜底。
  *
  * ≤200 字硬约束（LANDSCAPE_MAX_CHARS，定稿 v2 §四-2）。
@@ -726,14 +737,14 @@ function buildLandscapeNarrative(reactData, soulData, landscapeData) {
   const landAct = land && land.activation && typeof land.activation === "object"
     ? land.activation : null;
 
-  // 熵比：/landscape entropy_norm 优先（弥散态闸门），react/soul 兜底
+  // 熵比：/landscape entropy_norm 优先（熵饱和区读数闸门），react/soul 兜底
   const entropyRatio = typeof landAct?.entropy_norm === "number"
     ? landAct.entropy_norm
     : (typeof react.entropy_ratio === "number"
         ? react.entropy_ratio
         : (typeof st.entropy_ratio === "number" ? st.entropy_ratio : null));
 
-  // 弥散态降级路径（R4）：entropy > 0.98 → 探测型注入（读数 + [异常]）
+  // 熵饱和区降级路径（R4）：entropy > 0.98 → 探测型读数注入（读数 + 不可判标注）
   if (entropyRatio !== null && entropyRatio >= DIFFUSE_ENTROPY_RATIO) {
     const probe = buildDiffuseProbe(react, st, entropyRatio, landscapeData);
     if (probe) {

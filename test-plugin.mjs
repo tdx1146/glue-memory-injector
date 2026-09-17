@@ -252,19 +252,21 @@ await okAsync("buildSoulText：超长被截断到 maxChars", () => {
 });
 
 // ── 阶段 1 弥散态专项（2026-08-16，v1.2 §四）：探测型注入判据 3.09 ──
-await okAsync("buildDiffuseProbe：弥散态报可验证读数 + [异常] 显式标记（判据 3.09）", () => {
+await okAsync("buildDiffuseProbe：熵饱和区报可验证读数 + 不可判标注（判据 3.09，2026-09-18 更正）", () => {
   const probe = buildDiffuseProbe(
     { entropy_ratio: 0.9998, surprise: 9.96, mse: 0.9075, precision_mean: 0.3361 },
     {},
     0.9998,
   );
-  assert.ok(probe && probe.includes("[异常] 弥散态"), `应含 [异常] 弥散态 显式标记，实际: ${probe}`);
+  assert.ok(probe && probe.includes("不可判"), `应含 不可判 显式状态标注，实际: ${probe}`);
+  assert.ok(!probe.includes("[异常]"), `不得再把熵高标为 [异常]（必然误报），实际: ${probe}`);
   assert.ok(probe.includes("熵0.9998"), `应含可验证读数熵0.9998，实际: ${probe}`);
   assert.ok(probe.includes("惊讶9.96"), `应含可验证读数惊讶9.96，实际: ${probe}`);
   assert.ok(probe.includes("mse0.908") || probe.includes("mse0.907"), `应含 mse 读数，实际: ${probe}`);
-  assert.ok(probe.includes("行为层过渡补丁，不等同于状态场修复"), `应含定位标注，实际: ${probe}`);
-  // 判据 3.09（v1.2）：报数与报异常数可区分——显式 [异常] 标签在读数行首
-  assert.ok(probe.indexOf("[异常]") < probe.indexOf("惊讶"), "显式异常标记应在读数之前");
+  assert.ok(probe.includes("存量判据失效"), `应含存量判据失效标注，实际: ${probe}`);
+  assert.ok(probe.includes("2026-09-18 量化"), `应引 09-18 量化来源，实际: ${probe}`);
+  // 判据 3.09（v1.2，2026-09-18 更正）：状态标注在读数行首，且措辞为不可判
+  assert.ok(probe.indexOf("不可判") < probe.indexOf("惊讶"), "状态标注应在读数之前");
 });
 
 await okAsync("buildDiffuseProbe：非弥散态（熵比低于阈值）→ 注入面不输出探测段", () => {
@@ -277,18 +279,18 @@ await okAsync("buildDiffuseProbe：非弥散态（熵比低于阈值）→ 注�
   );
   assert.ok(narr === null || !narr.includes("[异常]"),
     `非弥散态不应输出探测段（[异常] 标记），实际: ${narr}`);
-  // 弥散态经同一注入面入口 → 输出探测段（回归验证闸门在职）
+  // 熵饱和区经同一注入面入口 → 输出探测段（回归验证闸门在职）
   const probe = buildLandscapeNarrative(
     { reaction: { entropy_ratio: 0.9998, surprise: 9.96 } },
     {},
   );
-  assert.ok(probe && probe.includes("[异常] 弥散态"),
-    `弥散态经注入面应输出探测段，实际: ${probe}`);
+  assert.ok(probe && probe.includes("不可判·熵饱和区"),
+    `熵饱和区经注入面应输出探测段，实际: ${probe}`);
 });
 
 await okAsync("buildDiffuseProbe：字段缺失 fail-open（不编数字）", () => {
   const probe = buildDiffuseProbe({ entropy_ratio: 0.9998 }, {}, 0.9998);
-  assert.ok(probe && probe.includes("[异常]"), "仅熵比在场也应报状态+异常标记");
+  assert.ok(probe && probe.includes("不可判"), "仅熵比在场也应报状态 + 不可判标注");
   assert.ok(probe.includes("缺口"), "缺口行应存在（显式不可读，不编数字）");
 });
 
@@ -335,7 +337,7 @@ ok("P1-1 景观叙事：真实 /landscape 读数派生（主导盆地/激活拓�
   assert.ok(!/潮涌|翻涌|苏醒|低语|结晶前|唤醒.*灵魂/.test(narr), `无文学化表述，实际 ${narr}`);
 });
 
-ok("P1-1 景观叙事：弥散态降级路径（entropy>0.98 → 探测型注入 [异常]）", () => {
+ok("P1-1 景观叙事：熵饱和区降级路径（entropy>0.98 → 探测型读数注入 不可判）", () => {
   const landscapeData = {
     landscape: {
       num_nodes: 256,
@@ -351,7 +353,8 @@ ok("P1-1 景观叙事：弥散态降级路径（entropy>0.98 → 探测型注入
     { lms_state: { entropy_ratio: 0.995, last_surprise: 2.36 } },
     landscapeData,
   );
-  assert.ok(out && out.includes("[异常] 弥散态"), `弥散态应走探测型注入（[异常] 标记），实际 ${out}`);
+  assert.ok(out && out.includes("不可判·熵饱和区") && !out.includes("[异常]"),
+    `熵饱和区应走探测型读数注入（不可判标注、非 [异常]），实际 ${out}`);
   assert.ok(out.includes("激活256/256"), `探测段应含 /landscape 激活拓扑读数，实际 ${out}`);
   assert.ok(out.includes("σmax0.42"), `探测段应含 σmax 读数，实际 ${out}`);
   assert.ok(out.length <= 200, `探测段应 ≤200 字，实际 ${out.length}`);
@@ -1256,7 +1259,7 @@ await okAsync("P1-1 真实 /landscape 直调（127.0.0.1:8190，只读）→ 读
   const act = land.landscape.activation;
   assert.ok(typeof act?.entropy_norm === "number", "应含 entropy_norm（读数派生主源）");
   assert.ok(Array.isArray(act?.top_activated) && act.top_activated.length > 0, "应含 top_activated");
-  // 直调链路整链验证：/landscape 数据 → 叙事（弥散态走 [异常] 探测）
+  // 直调链路整链验证：/landscape 数据 → 叙事（熵饱和区走 不可判 读数探测）
   const narr = buildLandscapeNarrative({ reaction: {} }, { lms_state: {} }, land);
   assert.ok(narr && narr.length <= 200, `景观叙事 ≤200 字，实际 ${narr ? narr.length : "null"}`);
   console.log(`     (熵比${act.entropy_norm.toFixed(3)}, σmax${Math.max(...act.top_activated.map(t => Math.abs(t.sigma))).toFixed(2)}, 叙事 ${narr.length} 字)`);
