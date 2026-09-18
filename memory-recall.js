@@ -29,7 +29,7 @@
 //
 // 阶段 2 步骤 2（P1-1 完整落地，2026-08-16，定稿 v2 §四）：
 //   ②景观叙事主缺口修复：直调 LMS GET /landscape/{sid}（端点已存在，只读
-//     fail-open）→ 读数派生叙事（主导盆地数/激活拓扑/σmax·sat/熵比/惊讶漂移），
+//     fail-open）→ 读数派生叙事（主导盆地数/激活拓扑/max|σ_act|·sat/熵比/惊讶漂移），
 //     禁止文学化（B 级后新尺度：surprise ~20 量级、σ 层级出现、sat 0.88→0.00）；
 //     熵饱和区（entropy > 0.98）走探测型读数注入（读数 + 不可判标注，非异常判定）——R4 降级路径。
 //   ③thought：1 条默认 + 余量灰度升 2（R7；C1 观测：INJECTED len 分布 + 回魂段截断率）。
@@ -601,15 +601,15 @@ const DIFFUSE_ENTROPY_RATIO = (() => {
  * “输出可验证的状态读数（具体数字/漂移量）+ 显式状态标注”；标注 = 不可判，非 [异常]）。
  *
  * 样例（v1.2 §四；2026-09-18 更正后）：
- *   状态：不可判·熵饱和区（熵 0.9998 / 激活 256/256 / σmax 0.999）
+ *   状态：不可判·熵饱和区（熵 0.9998 / 激活 256/256 / max|σ_act| 0.999）
  *   漂移读数：entropy Δ=+0.0002 / 惊讶 9.96
  *   缺口：fok=0 / low_confidence=0
  *   [诊断标注（非读数）：惊讶度 mse 线性、方向无响应——供诊断/决策消费，
  *    不入“报数”行]
  *
  * 阶段 2 P1-1：landscapeData 在场时，状态行并入 /landscape 激活拓扑读数
- * （激活 A/N·σmax）——弥散态下 σ 扁平本身就是特征读数（B 级后尺度：
- * sat 0.88→0.00、σmax 回落），报数不编故事。
+ * （激活 A/N·max|σ_act|）——弥散态下 σ 扁平本身就是特征读数（B 级后尺度：
+ * sat 0.88→0.00、max|σ_act| 回落），报数不编故事。
  *
  * 读数行只放可验证数字；诊断结论单列为 [诊断标注] 段（不入报数行）。
  * 数据源：/react reaction.{entropy_ratio,surprise,mse,precision_mean,coherence}
@@ -647,7 +647,13 @@ function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
     if (Array.isArray(landAct.top_activated) && landAct.top_activated.length > 0) {
       const sigmaMax = Math.max(...landAct.top_activated
         .map((t) => (t && typeof t.sigma === "number") ? Math.abs(t.sigma) : 0));
-      if (sigmaMax > 1e-9) bits.push(`σmax${sigmaMax.toFixed(2)}`);
+      // [2026-09-18 同名不同义踩坑记录] 本读数 = activation.top_activated 的 max|σ|
+      // = **最强节点激活幅值**（无量纲，[0,1]）——**不是** energy.sigma_max
+      // （J 谱半径，随 ‖J‖_F 缩放，实测 7~12），**也不是** σmax/‖J‖_F 比值。
+      // 旧文案裸写 `σmax0.93`，与守护/报告里的 σmax（J 谱半径）同名 ⇒ 同一响应
+      // 两处 σmax 差 8.4 倍、读者（人和模型）误当同一量（四妹 09-18 文书）。
+      // 故渲染名改为 max|σ_act|（定义随名自带，杜绝与 σmax(J) 撞名）。
+      if (sigmaMax > 1e-9) bits.push(`max|σ_act|${sigmaMax.toFixed(2)}`);
     }
   }
   if (surprise !== null) bits.push(`惊讶${surprise.toFixed(2)}`);
@@ -699,11 +705,13 @@ function buildDiffuseProbe(react, st, entropyRatio, landscapeData = null) {
  * 数据源 = fetchLandscape 直调 LMS GET /landscape/{sid}（端点已存在，只读 fail-open）。
  *
  * 读数派生字段（全部可验证，禁止文学化）：
- *   - 主导盆地数：top_activated 中 |σ| ≥ 0.5 的个数（B 级后新尺度 σmax≈0.79、
+ *   - 主导盆地数：top_activated 中 |σ| ≥ 0.5 的个数（B 级后新尺度 max|σ_act|≈0.79、
  *     σ 层级出现：p10 0.575/p50 0.652/p90 0.727；0.5 以上=显著激活盆地）
  *   - 激活拓扑：active_nodes/num_nodes（如 253/256）
- *   - σ 层级：σmax + 峰差 Δ（top1−top2）+ sat 派生（σmax<0.9 ⇒ sat=0.00，
+ *   - σ 层级：max|σ_act| + 峰差 Δ（top1−top2）+ sat 派生（max|σ_act|<0.9 ⇒ sat=0.00，
  *     B 级后 sat 0.88→0.00 的读数依据——top_activated 含全局最大 |σ|）
+ *     注：此处的 σ 是**激活幅值**（无量纲），不是 energy.sigma_max（J 谱半径）；
+ *     09-18 前两者都渲染成裸 `σmax` ⇒ 同名不同义（见 buildDiffuseProbe 注释）
  *   - 漂移读数：惊讶（/react reaction.surprise 或 /soul last_surprise，
  *     B 级后 ~20 量级）+ surprise_z 方向（>1 上升 / <-1 回落 / 平稳）
  *
@@ -765,11 +773,13 @@ function buildLandscapeNarrative(reactData, soulData, landscapeData) {
     if (top.length > 0) {
       // 主导盆地数：|σ| ≥ 0.5（B 级后新尺度）
       const dominant = top.filter((v) => v >= 0.5).length;
-      // σ 层级：σmax + 峰差 Δ（top1−top2）+ sat 派生
+      // σ 层级：max|σ_act| + 峰差 Δ（top1−top2）+ sat 派生
+      // [2026-09-18 同名不同义] 渲染名由裸 `σmax` 改为 `max|σ_act|`——此值是
+      // 激活幅值（无量纲），非 J 谱半径 σmax（7~12）、非 σmax/‖J‖_F 比值。
       const sigmaMax = Math.max(...top);
       const sigma2 = top.length > 1 ? Math.max(...top.slice(1)) : 0;
       const peakGap = sigmaMax - sigma2;
-      const sat = sigmaMax < 0.9 ? "0.00" : ">0"; // σmax<0.9 ⇒ 无饱和（B 级后）
+      const sat = sigmaMax < 0.9 ? "0.00" : ">0"; // max|σ_act|<0.9 ⇒ 无饱和（B 级后）
       const numNodes = typeof land.num_nodes === "number" ? land.num_nodes : null;
       const active = typeof landAct.active_nodes === "number" ? landAct.active_nodes : null;
       const topo = (active !== null && numNodes !== null)
@@ -781,7 +791,7 @@ function buildLandscapeNarrative(reactData, soulData, landscapeData) {
           `主导盆地${dominant}`,
           topo,
           entropyBit,
-          `σmax${sigmaMax.toFixed(2)}·Δ${peakGap.toFixed(2)}·sat${sat}`,
+          `max|σ_act|${sigmaMax.toFixed(2)}·Δ${peakGap.toFixed(2)}·sat${sat}`,
         ].filter(Boolean).join("｜"),
       );
     }

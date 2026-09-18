@@ -319,18 +319,19 @@ ok("P1-1 景观叙事：真实 /landscape 读数派生（主导盆地/激活拓�
       energy: { sigma_norm: 4.2, j_offdiag_std: 0.1559 },
     },
   };
-  // B 级后新尺度：surprise ~20 量级、σ 层级出现（σmax0.79）、sat 0.88→0.00
+  // B 级后新尺度：surprise ~20 量级、σ 层级出现（max|σ_act|0.79）、sat 0.88→0.00
+  // [2026-09-18 同名不同义] 渲染名由裸 σmax 改为 max|σ_act|（激活幅值≠J 谱半径）
   const narr = buildLandscapeNarrative(
     { reaction: { surprise: 19.8, surprise_z: 0.3, coherence: 0.85 } },
     { lms_state: { entropy_ratio: 0.62, last_surprise: 19.8 } },
     landscapeData,
   );
   assert.ok(narr && narr.startsWith("景观:"), `应以 景观: 开头，实际 ${narr}`);
-  // 读数派生（禁止文学化）：主导盆地数/激活拓扑/σmax·sat/惊讶漂移
+  // 读数派生（禁止文学化）：主导盆地数/激活拓扑/max|σ_act|·sat/惊讶漂移
   assert.ok(narr.includes("主导盆地6"), `应含主导盆地数（|σ|≥0.5 共 6 个），实际 ${narr}`);
   assert.ok(narr.includes("激活253/256"), `应含激活拓扑，实际 ${narr}`);
-  assert.ok(narr.includes("σmax0.79"), `应含 σmax（B 级后新尺度），实际 ${narr}`);
-  assert.ok(narr.includes("sat0.00"), `应含 sat 读数（σmax<0.9 → 0.00，B 级后），实际 ${narr}`);
+  assert.ok(narr.includes("max|σ_act|0.79"), `应含激活幅值读数 max|σ_act|（B 级后新尺度），实际 ${narr}`);
+  assert.ok(narr.includes("sat0.00"), `应含 sat 读数（max|σ_act|<0.9 → 0.00，B 级后），实际 ${narr}`);
   assert.ok(narr.includes("惊讶19.8"), `应含惊讶漂移读数（~20 量级），实际 ${narr}`);
   assert.ok(narr.length <= 200, `景观叙事应 ≤200 字，实际 ${narr.length}`);
   // 禁止文学化：无叙事套话（3.08 教训："弥散态是结晶前的东西"类空话）
@@ -356,7 +357,7 @@ ok("P1-1 景观叙事：熵饱和区降级路径（entropy>0.98 → 探测型读
   assert.ok(out && out.includes("不可判·熵饱和区") && !out.includes("[异常]"),
     `熵饱和区应走探测型读数注入（不可判标注、非 [异常]），实际 ${out}`);
   assert.ok(out.includes("激活256/256"), `探测段应含 /landscape 激活拓扑读数，实际 ${out}`);
-  assert.ok(out.includes("σmax0.42"), `探测段应含 σmax 读数，实际 ${out}`);
+  assert.ok(out.includes("max|σ_act|0.42"), `探测段应含激活幅值读数 max|σ_act|，实际 ${out}`);
   assert.ok(out.length <= 200, `探测段应 ≤200 字，实际 ${out.length}`);
 });
 
@@ -1262,7 +1263,7 @@ await okAsync("P1-1 真实 /landscape 直调（127.0.0.1:8190，只读）→ 读
   // 直调链路整链验证：/landscape 数据 → 叙事（熵饱和区走 不可判 读数探测）
   const narr = buildLandscapeNarrative({ reaction: {} }, { lms_state: {} }, land);
   assert.ok(narr && narr.length <= 200, `景观叙事 ≤200 字，实际 ${narr ? narr.length : "null"}`);
-  console.log(`     (熵比${act.entropy_norm.toFixed(3)}, σmax${Math.max(...act.top_activated.map(t => Math.abs(t.sigma))).toFixed(2)}, 叙事 ${narr.length} 字)`);
+  console.log(`     (熵比${act.entropy_norm.toFixed(3)}, max|σ_act|${Math.max(...act.top_activated.map(t => Math.abs(t.sigma))).toFixed(2)}, 叙事 ${narr.length} 字)`);
 });
 
 await okAsync("P1-1 集成：真实链路六层齐 + 总注入 ≤800 + 景观 ≤200 + thought 可见", async () => {
@@ -1287,7 +1288,7 @@ await okAsync("P1-1 集成：真实链路六层齐 + 总注入 ≤800 + 景观 �
   // P2-5（审计 2026-08-16）：旧断言 `indexOf(" / ", landIdx)` 在弥散态探测段内部
   // （bits 以 " / " 连接）提前截断 → landLen≈22 恒过（假阳性）。修正：只认**顶层**
   // [回魂] part 分隔符——" / " 后跟 thought:/最近: 的才是段分隔；探测段内部
-  // " / " 后跟读数位（数字/σmax…）不匹配；搜索边界 = [记忆注入] 块前（soul 段内）。
+  // " / " 后跟读数位（数字/max|σ_act|…）不匹配；搜索边界 = [记忆注入] 块前（soul 段内）。
   const soulEndIdx = text.indexOf("\n\n[记忆注入]", landIdx);
   const searchEnd = soulEndIdx !== -1 ? soulEndIdx : text.length;
   let landEnd = -1;
