@@ -31,8 +31,9 @@
 // 人机标记（2026-09-19，与 scripts/session_store.py 旁路同构）：
 //   真实对话走的是本路（agent_end → glue /store-turn → LMS /store → archive），
 //   而旁路 session_store.py 扫的 DSH 会话没有新回合（存 0 跳过 0）。
-//   ⇒ 用户回合 payload 带 source_kind='user'（人类原话）、INTERSESSION 模式 B 与
-//     机器注入的唤醒信（📬【信箱…】）带 'agent'（非人类原话）；self 伴生条由 lms-api 恒记 'agent'。
+//   ⇒ 用户回合 payload 带 source_kind='user'（人类原话）；INTERSESSION 模式 B 与
+//     机器注入/自造的「用户回合」（think_loop 自造提示词、信箱唤醒信…）带 'agent'
+//     （非人类原话，防自指污染回流）；self 伴生条由 lms-api 恒记 'agent'。
 //   开关 config.storeTurn.sourceKindEnabled（默认 true）；关掉 = 不发该字段 =
 //   旧 wire 形状零变化。判据见 docs/plan_判据统一-source_kind为准-20260919.md §3.2。
 
@@ -57,14 +58,23 @@ const MARK_AGENT = "agent";
 // 开关 env fallback（config.storeTurn.sourceKindEnabled 优先；未设时读本 env，
 // 仅 "0"/"false" 关，缺省开——与 GLUE_STORE_TURN_ENABLED 同一「config 优先 + env 兜底」模式）。
 const STORE_SOURCE_KIND_ENV = "GLUE_STORE_SOURCE_KIND_ENABLED";
-// 机器注入的「用户回合」识别（2026-09-19）：OpenClaw 侧有把机器文本当 user 消息注入的
-// 通道（mailbox-poll 每 2 分钟 chat.send 一条唤醒信："📬【信箱新消息】见
-// /tmp/mailbox-inbox.txt（mailbox-poll 自动唤醒）"）。这类不是人类原话 ⇒ 标 'agent'
-// 而非 'user'，否则判据侧（understand_poll §3.2：'user'⇒ALLOW）会把机器注入当人话放行
-// （正是 P0-7 要防的）。只认已知的唤醒信形状，窄匹配、宁漏不误伤真人（标错代价：漏一轮重理解）。
-const _MACHINE_USER_TURN_RE = /📬\s*【信箱|mailbox-poll 自动唤醒/;
+// 机器注入的「用户回合」识别（2026-09-19）：OpenClaw 侧有多条把机器文本当 user
+// 消息注入/自造的通道，它们在 archive 里都进了 external 条目（实测：think_loop
+// 自造提示词 284 条、信箱唤醒信 96 条，另有 wake-bridge / 梦中醒来 / 回魂 等）——都不是
+// 人类原话。若一律标 'user'，判据侧（understand_poll §3.2：'user'⇒ALLOW）会把机器注入
+// 当人话放行（正是 P0-7 要防的自指污染）。故这些形状标 'agent'。
+// 原则：只认**已在档案里实测**的形状；宁漏不误伤真人（漏标代价：漏一轮重理解，
+// 存量仍走旧逻辑、不回归）。长期解：DSH 的 source.kind 随数据流下来（四妹 §27D）。
+const _MACHINE_USER_TURN_RES = [
+  /你是思考链的【后台思考者】/, // think_loop 调度器自造提示词（THINK_LOOP_FINGERPRINT）
+  /📬\s*【信箱/, // mailbox-poll 唤醒信（chat.send 注入）
+  /【信箱·留言/, // mailbox-injector 定向送达段
+  /\[wake-bridge\]/i, // wake-bridge 注入
+  /【梦中醒来】/, // 自主醒来注入
+];
 function isMachineInjectedUserTurn(text) {
-  return _MACHINE_USER_TURN_RE.test(String(text || ""));
+  const t = String(text || "");
+  return _MACHINE_USER_TURN_RES.some((re) => re.test(t));
 }
 const STORE_LOG_FILE = "/tmp/glue-store-debug.log";
 // C-18 断流告警状态文件（2026-08-13 事故 P0 补洞）：每轮 agent_end（含所有 SKIP 分支）

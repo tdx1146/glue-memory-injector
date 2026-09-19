@@ -1720,16 +1720,17 @@ await okAsync("buildStorePayload：人机标记（用户回合 user / INTERSESSI
     "agent",
     "模式 B（机器产出）应带 'agent'",
   );
-  // 机器注入的「用户回合」（信箱唤醒信）⇒ 'agent'（不是人类原话）
-  assert.equal(
-    buildStorePayload(
-      { userInput: "[Sat 2026-09-19 18:36 GMT+8] 📬【信箱新消息】见 /tmp/mailbox-inbox.txt（mailbox-poll 自动唤醒）", assistantText: "回信" },
-      cfg,
-      "main",
-    ).source_kind,
-    "agent",
-    "信箱唤醒信（机器注入）应带 'agent'，不得标 'user'",
-  );
+  // 机器注入/自造的「用户回合」⇒ 'agent'（不是人类原话；防 P0-7 自指污染）
+  for (const [label, u] of [
+    ["信箱唤醒信", "[Sat 2026-09-19 18:36 GMT+8] 📬【信箱新消息】见 /tmp/mailbox-inbox.txt（mailbox-poll 自动唤醒）"],
+    ["think_loop 自造提示词", "[Sat 2026-09-19 18:40 GMT+8] 你是思考链的【后台思考者】（隔离子代理…）"],
+  ]) {
+    assert.equal(
+      buildStorePayload({ userInput: u, assistantText: "产出" }, cfg, "main").source_kind,
+      "agent",
+      `${label}（机器产出）应带 'agent'，不得标 'user'`,
+    );
+  }
   // 开关关 ⇒ 不发该字段（旧 wire 形状零变化）
   const off = resolveStoreConfig({ storeTurn: { sourceKindEnabled: false } }, {});
   assert.equal("source_kind" in buildStorePayload({ userInput: "u", assistantText: "a" }, off, "main"), false, "开关关时不得带 source_kind 字段");
