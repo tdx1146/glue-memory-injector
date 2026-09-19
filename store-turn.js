@@ -27,6 +27,14 @@
 //   4. 绝不阻塞：自身 AbortSignal 12s（M-3）<< 30s hook 预算；绝不重试（503 不重试，C-05 先例）。
 //   5. 去重：插件侧指纹（同 runId + 内容哈希 turnKey 双键，M-2）＋LMS /store 60s 幂等窗口（权威）。
 //   6. 防污染四闸：心跳/子代理/cron/模板 + INTERSESSION-EXTRACT 成果提取（M-4）。
+//
+// 人机标记（2026-09-19，与 scripts/session_store.py 旁路同构）：
+//   真实对话走的是本路（agent_end → glue /store-turn → LMS /store → archive），
+//   而旁路 session_store.py 扫的 DSH 会话没有新回合（存 0 跳过 0）。
+//   ⇒ 用户回合 payload 带 source_kind='user'（人类原话）、INTERSESSION 模式 B 与
+//     机器注入的唤醒信（📬【信箱…】）带 'agent'（非人类原话）；self 伴生条由 lms-api 恒记 'agent'。
+//   开关 config.storeTurn.sourceKindEnabled（默认 true）；关掉 = 不发该字段 =
+//   旧 wire 形状零变化。判据见 docs/plan_判据统一-source_kind为准-20260919.md §3.2。
 
 import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -42,6 +50,22 @@ const FINGERPRINT_CAP = 100;
 const USER_MAX_CHARS = 2000;
 const OUTPUT_MAX_CHARS = 20000;
 const SENDER = "openclaw-agent_end";
+// 人机标记值（2026-09-19）：写侧声明的来源种类——'user'=人类原话 / 'agent'=机器。
+// 与 session_store.py 的 SOURCE_KIND_USER 同值（glue/lms-api/archive 全线已支持）。
+const MARK_USER = "user";
+const MARK_AGENT = "agent";
+// 开关 env fallback（config.storeTurn.sourceKindEnabled 优先；未设时读本 env，
+// 仅 "0"/"false" 关，缺省开——与 GLUE_STORE_TURN_ENABLED 同一「config 优先 + env 兜底」模式）。
+const STORE_SOURCE_KIND_ENV = "GLUE_STORE_SOURCE_KIND_ENABLED";
+// 机器注入的「用户回合」识别（2026-09-19）：OpenClaw 侧有把机器文本当 user 消息注入的
+// 通道（mailbox-poll 每 2 分钟 chat.send 一条唤醒信："📬【信箱新消息】见
+// /tmp/mailbox-inbox.txt（mailbox-poll 自动唤醒）"）。这类不是人类原话 ⇒ 标 'agent'
+// 而非 'user'，否则判据侧（understand_poll §3.2：'user'⇒ALLOW）会把机器注入当人话放行
+// （正是 P0-7 要防的）。只认已知的唤醒信形状，窄匹配、宁漏不误伤真人（标错代价：漏一轮重理解）。
+const _MACHINE_USER_TURN_RE = /📬\s*【信箱|mailbox-poll 自动唤醒/;
+function isMachineInjectedUserTurn(text) {
+  return _MACHINE_USER_TURN_RE.test(String(text || ""));
+}
 const STORE_LOG_FILE = "/tmp/glue-store-debug.log";
 // C-18 断流告警状态文件（2026-08-13 事故 P0 补洞）：每轮 agent_end（含所有 SKIP 分支）
 // 原子更新，供契约 C-18 判定"有对话但写侧断流"。原子写=临时文件+rename，异常 fail-open。
@@ -147,6 +171,14 @@ export function resolveStoreConfig(pluginConfig, env = process.env) {
     timeoutMs: Number.isFinite(st.timeoutMs)
       ? Math.max(1000, Math.min(30000, Math.floor(st.timeoutMs)))
       : STORE_TIMEOUT_MS,
+    // 人机标记开关（2026-09-19）：config 显式值优先，未设时 env 兜底（仅 "0"/"false"
+    // 关）。缺省开 = 与 session_store.py 的 STORE_SOURCE_KIND 默认一致。
+    sourceKindEnabled:
+      st.sourceKindEnabled === true
+        ? true
+        : st.sourceKindEnabled === false
+          ? false
+          : !["0", "false"].includes(env && env[STORE_SOURCE_KIND_ENV]),
     glueUrl:
       typeof pc.glueUrl === "string" && pc.glueUrl ? pc.glueUrl : GLUE_DEFAULT_URL,
   };
@@ -236,12 +268,22 @@ export function extractTurnFromMessages(messages, _ctx) {
  * 组装 /store-turn 请求 payload（sender 仅 glue 日志审计用，不转发）。
  */
 export function buildStorePayload(turn, cfg, sessionId) {
-  return {
+  const payload = {
     session_id: sessionId,
     user_input: String(turn.userInput || "").slice(0, cfg.userMaxChars),
     llm_output: String(turn.assistantText || "").slice(0, cfg.outputMaxChars),
     sender: SENDER,
   };
+  // 人机标记（2026-09-19）：真实对话这条路也声明来源种类（与旁路 session_store
+  // 同构），让下游重理解层不必再猜"谁是人才"（判据见规格 §3.2）。
+  //   · 普通用户回合 ⇒ 'user'（人类原话）
+  //   · INTERSESSION 模式 B（userInput 已置空、只留自述段）⇒ 'agent'（机器产出）
+  // 关掉开关 ⇒ 不发该字段（旧 wire 形状零变化）。
+  if (cfg.sourceKindEnabled) {
+    payload.source_kind =
+      turn.modeB || isMachineInjectedUserTurn(turn.userInput) ? MARK_AGENT : MARK_USER;
+  }
+  return payload;
 }
 
 /**
@@ -426,11 +468,12 @@ export async function handleAgentEnd(event, ctx, api, env = process.env) {
         "STORE-OK",
         `session=${sid} turn=${String(d.turn_count)} stored=${String(d.stored)} ` +
           `seq=${seq} core_chars=${String(d.core_chars)} gray=${String(d.gray)} ` +
+          `mark=${String(payload.source_kind ?? "")} ` +
           `dedup=${String(d.dedup_hit)} run=${runId}`,
       );
     } else {
       // 判据 2 分桶：502（LMS 不可达=真失败）/ timeout（embed 慢=环境）/ 其他
-      logStore("STORE-FAIL", `status=${result.status} run=${runId}`);
+      logStore("STORE-FAIL", `status=${result.status} mark=${String(payload.source_kind ?? "")} run=${runId}`);
     }
   } catch (err) {
     // fail-open 兜底：钩子内任何异常都不外抛（runner 另有 catch）

@@ -79,6 +79,11 @@
             "maximum": 30000,
             "default": 12000,
             "description": "写请求 AbortSignal 超时（M-3 校准：/store 内部 3×跨机 embed 最坏 ≈6.75s，12s << 30s hook 预算）"
+          },
+          "sourceKindEnabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "人机标记开关（2026-09-19）：true 时用户回合 payload 带 source_kind='user'、INTERSESSION 带 'agent'（落 archive，供判据侧读）；false = 不发该字段（旧 wire 形状零变化）"
           }
         }
       }

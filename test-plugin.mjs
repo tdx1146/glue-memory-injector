@@ -1706,6 +1706,41 @@ await okAsync("buildStorePayload：字段 + sender 审计 + 截断", () => {
   assert.equal(p.user_input, "u");
   assert.equal(p.sender, "openclaw-agent_end");
   assert.equal(p.llm_output.length, cfg.outputMaxChars, "llm_output 应截断到 outputMaxChars");
+  // 人机标记（2026-09-19）：普通用户回合 ⇒ 'user'（默认开）
+  assert.equal(p.source_kind, "user", "用户回合应带 source_kind='user'");
+});
+
+await okAsync("buildStorePayload：人机标记（用户回合 user / INTERSESSION agent / 开关关则不发）", () => {
+  const cfg = resolveStoreConfig({ storeTurn: { enabled: true } }, {});
+  // 普通用户回合 ⇒ 'user'
+  assert.equal(buildStorePayload({ userInput: "人话", assistantText: "答" }, cfg, "main").source_kind, "user");
+  // INTERSESSION 模式 B（userInput 已置空）⇒ 'agent'
+  assert.equal(
+    buildStorePayload({ userInput: "", assistantText: "自述", modeB: true }, cfg, "main").source_kind,
+    "agent",
+    "模式 B（机器产出）应带 'agent'",
+  );
+  // 机器注入的「用户回合」（信箱唤醒信）⇒ 'agent'（不是人类原话）
+  assert.equal(
+    buildStorePayload(
+      { userInput: "[Sat 2026-09-19 18:36 GMT+8] 📬【信箱新消息】见 /tmp/mailbox-inbox.txt（mailbox-poll 自动唤醒）", assistantText: "回信" },
+      cfg,
+      "main",
+    ).source_kind,
+    "agent",
+    "信箱唤醒信（机器注入）应带 'agent'，不得标 'user'",
+  );
+  // 开关关 ⇒ 不发该字段（旧 wire 形状零变化）
+  const off = resolveStoreConfig({ storeTurn: { sourceKindEnabled: false } }, {});
+  assert.equal("source_kind" in buildStorePayload({ userInput: "u", assistantText: "a" }, off, "main"), false, "开关关时不得带 source_kind 字段");
+});
+
+await okAsync("resolveStoreConfig：人机标记开关 = config 优先 + env 兜底（缺省开）", () => {
+  assert.equal(resolveStoreConfig({}, {}).sourceKindEnabled, true, "全未设 = 开");
+  assert.equal(resolveStoreConfig({ storeTurn: { sourceKindEnabled: false } }, { GLUE_STORE_SOURCE_KIND_ENABLED: "1" }).sourceKindEnabled, false, "config=false 显式关，env 不得覆盖");
+  assert.equal(resolveStoreConfig({ storeTurn: { sourceKindEnabled: true } }, { GLUE_STORE_SOURCE_KIND_ENABLED: "0" }).sourceKindEnabled, true, "config=true 不被 env=0 覆盖");
+  assert.equal(resolveStoreConfig({}, { GLUE_STORE_SOURCE_KIND_ENABLED: "0" }).sourceKindEnabled, false, "env='0' 关（fallback）");
+  assert.equal(resolveStoreConfig({}, { GLUE_STORE_SOURCE_KIND_ENABLED: "false" }).sourceKindEnabled, false, "env='false' 关（fallback）");
 });
 
 await okAsync("resolveStoreConfig：开关 = config 优先 + env fallback（2026-08-12 最终定案）", () => {
