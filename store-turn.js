@@ -45,9 +45,12 @@ import { appendFileSync, readFileSync, renameSync, writeFileSync } from "node:fs
 import { stripInboundMetadata } from "./memory-recall.js";
 
 const GLUE_DEFAULT_URL = "http://127.0.0.1:19000";
-// M-3 校准：/store 内部 3 次跨机 embed 常态 3.6-4.5s、最坏 ≈6.75s；
-// 插件 AbortSignal 12s（glue 之上 +2s 缓冲）<< 30s hook 预算。
-const STORE_TIMEOUT_MS = 12000;
+// 写超时校准（2026-09-20 修复单，M-3 重标）：旧 12s 基于“/store 内部 3×跨机
+// embed 最坏 ≈6.75s”的旧假设——实测不成立：手机 bge-m3 嵌入 ≈4.5–6.5ms/字，
+// 整回合文本（user+assistant，可达数千字）单次 embed 即 8–17s，+process ~3.4s
+// ⇒ /store 常态 11–17s，旧 12s 熔断必中。glue 侧 lms_timeout 同步 10s→25s。
+// 28s = 25s(glue) + 3s 余量，仍 < 30s hook 预算（index.js AGENT_END_TIMEOUT_MS）。
+const STORE_TIMEOUT_MS = 28000;
 const RATE_LIMIT_MS = 3000;       // 两次自动写入最小间隔（防写放大）
 const FINGERPRINT_WINDOW_MS = 60000;
 const FINGERPRINT_CAP = 100;
@@ -300,7 +303,7 @@ export function buildStorePayload(turn, cfg, sessionId) {
 }
 
 /**
- * 调 glue /store-turn（POST，AbortSignal=timeoutMs 默认 12s，M-3）。
+ * 调 glue /store-turn（POST，AbortSignal=timeoutMs 默认 28s，2026-09-20 重标）。
  * 返回 {ok:true, data} | {ok:false, status}，status ∈ 429|503|502|<其他状态码>|timeout|network。
  *   - 429/503 → 不重试（C-05 先例：503=做梦协调/熔断降级属预期失败）
  *   - 502（glue 透传：LMS 不可达=真失败，判据 2 计入）

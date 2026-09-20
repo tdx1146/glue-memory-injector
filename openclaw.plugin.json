@@ -77,8 +77,8 @@
             "type": "integer",
             "minimum": 1000,
             "maximum": 30000,
-            "default": 12000,
-            "description": "写请求 AbortSignal 超时（M-3 校准：/store 内部 3×跨机 embed 最坏 ≈6.75s，12s << 30s hook 预算）"
+            "default": 28000,
+            "description": "写请求 AbortSignal 超时（2026-09-20 重标：手机 bge-m3 ≈4.5–6.5ms/字，整回合文本单次 embed 8–17s + process ~3.4s；28s = glue 25s +3s 余量，仍 < 30s hook 预算）"
           },
           "sourceKindEnabled": {
             "type": "boolean",
