@@ -36,6 +36,9 @@
 //     （非人类原话，防自指污染回流）；self 伴生条由 lms-api 恒记 'agent'。
 //   开关 config.storeTurn.sourceKindEnabled（默认 true）；关掉 = 不发该字段 =
 //   旧 wire 形状零变化。判据见 docs/plan_判据统一-source_kind为准-20260919.md §3.2。
+//   2026-09-20 修：INTERSESSION 模式 B 的 userInput 已置空，写契约（glue/lms-api
+//   /store）必拒（400/422）⇒ 旧代码每次必 400、从未落库。现改为 handleAgentEnd
+//   直接跳过（reason=intersession），不发空 user_input；模式 B 不再产生 400。
 
 import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -443,6 +446,21 @@ export async function handleAgentEnd(event, ctx, api, env = process.env) {
     if (turn.skip) {
       logStore("STORE-SKIP", `reason=${turn.skip} run=${runId}`);
       updateStoreState({ skipReason: turn.skip });
+      return;
+    }
+
+    // 模式 B（INTERSESSION 回灌轮）→ 跳过，不发 /store（2026-09-20 修）。
+    // WHY：模式 B 的 userInput 已被置空（M-4：子代理报告全文不以「用户:」身份
+    // 入库），而写契约要求 user_input 非空——glue /store 见空值直接 `400
+    // "user_input 必填"`（实测探针），lms-api /store 见缺字段 `422`。
+    // ⇒ 旧代码执意发空 user_input，每次必 400、从未落库（零回归可证：archive
+    // 里无一行来自本路）；且这条是子代理回报回声（源头 run 已被子代理闸跳过），
+    // 本就不该以 external 条目污染检索面（与四闸同旨，防自指回流）。
+    // 收敛：机器产出回声不再冲写。若非人类原话也想入库，须由 lms-api 侧
+    // 另行扩展写契约（另单），不在插件侧造假 user_input。
+    if (turn.modeB) {
+      logStore("STORE-SKIP", `reason=intersession run=${runId}`);
+      updateStoreState({ skipReason: "intersession" });
       return;
     }
 

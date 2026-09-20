@@ -1872,7 +1872,7 @@ await okAsync("handleAgentEnd：LMS 挂（glue 502）→ STORE-FAIL 不抛错（
   } finally { server.close(); }
 });
 
-await okAsync("handleAgentEnd：INTERSESSION 轮 → 模式 B 写入（assistant 段入库）", async () => {
+await okAsync("handleAgentEnd：INTERSESSION 轮 → 模式 B 跳过（空 user_input 必 400/422，不落 external）", async () => {
   _resetFingerprintForTest();
   const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
   try {
@@ -1890,9 +1890,10 @@ await okAsync("handleAgentEnd：INTERSESSION 轮 → 模式 B 写入（assistant
       api,
       env,
     );
-    assert.equal(state.requests.length, 1, "模式 B 应写入 1 次");
-    assert.equal(state.bodies[0].user_input, "", "user 段（报告回声）丢弃");
-    assert.ok(state.bodies[0].llm_output.includes("采纳子代理结论"), "assistant 段入库");
+    // 2026-09-20 修：模式 B 的 userInput 已置空，而写契约要求 user_input 非空
+    // （glue /store → 400 "user_input 必填"；lms-api /store → 422）⇒ 必须跳过，
+    // 绝不发空 user_input 的必败请求（旧代码每次必 400、从未落库）。
+    assert.equal(state.requests.length, 0, "模式 B 不得写入（空 user_input 会被承接方 400）");
   } finally { server.close(); }
 });
 
