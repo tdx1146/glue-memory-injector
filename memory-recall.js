@@ -38,7 +38,7 @@
 
 import { appendFileSync, readFileSync } from "node:fs";
 
-const GLUE_DEFAULT_URL = "http://127.0.0.1:19000";
+const GLUE_DEFAULT_URL = process.env.GLUE_URL || "http://127.0.0.1:19000";
 // P1-1（阶段 2 步骤 2）：景观叙事直调 LMS /landscape/{sid}——插件与 LMS 同主机
 // （127.0.0.1:8191），直调零 glue 改动（任务书授权：首选直调）；只读 fail-open。
 // [2026-08-30 修复] V1 LMS :8190 已停用（四妹 V2 切换，agentos-v2/lms-api 监听 :8191）。
@@ -80,7 +80,7 @@ const INJECT_MAX_CHARS = 12000;
 // 热路径不加 embed 网络调用）取 1-2 条注入；激活度低于阈值则不注入
 // （设计："当前对话激活了哪个 thought 注入哪个；未激活不注入"）。
 const THOUGHTS_FILE =
-  "/vol2/1000/AI专用/所有自动化/轻如烟/memory/thoughts.jsonl";
+  process.env.THOUGHTS_PATH || "/vol2/1000/AI专用/所有自动化/轻如烟/memory/thoughts.jsonl";
 const THOUGHTS_MAX_ITEMS = 10;   // 回看窗口（最近 N 条）
 // P1-4（审计 2026-08-14）：thought 注入面 ≤90 → ≤60 字/条。注入的是摘要
 // （全文在 thoughts.jsonl）；配合 P1-2 去重（同文本只注 1 条）+ 单条上限，
