@@ -60,6 +60,9 @@ const {
   dedupeNearDuplicateItems,
   stripMachineQuerySegments,
   extractQueryText,
+  extractQueryInfo,
+  stripMachineNoiseFromSoul,
+  buildSoulOnlyWakeText,
 } = await import("./memory-recall.js");
 
 let passed = 0;
@@ -2209,7 +2212,7 @@ ok("刀e：最近: 段机器制品（【重理解】）不进注入，人话最�
   assert.ok(on.includes("真·最近记忆"), "人话最近保留");
 });
 
-await okAsync("刀e 集成：唤醒轮不召回（零请求）；人类轮照常召回", async () => {
+await okAsync("刀e 集成：唤醒轮不召回（零 /recall 请求）；人类轮照常召回", async () => {
   const seen = [];
   const srv = http.createServer((req, res) => {
     let body = "";
@@ -2226,14 +2229,143 @@ await okAsync("刀e 集成：唤醒轮不召回（零请求）；人类轮照常
   try {
     _resetRateLimitForTest();
     const wake = "[Mon 2026-09-07 18:00 GMT+8] 🌙【梦中醒来】自主醒来（routine）：惊讶度 0.0 / 熵 0.00";
+    // 第六刀后：唤醒轮默认注【回魂】（只读 /soul），但**不得用机器词召回**（零 /recall）
     const out = await buildMemoryContext(wake, { glueUrl: `http://127.0.0.1:${port}`, minIntervalMs: 0, maxChars: 1500 });
-    assert.equal(out, null, "唤醒轮不注入");
-    assert.equal(seen.length, 0, `唤醒轮不得发起召回请求，实际 ${JSON.stringify(seen)}`);
+    assert.ok(!seen.some((u) => u.includes("/recall")), `唤醒轮不得发起召回请求，实际 ${JSON.stringify(seen)}`);
+    assert.ok(out === null || out.startsWith("[回魂]"), `唤醒轮只可能注回魂，实际 ${JSON.stringify(out)}`);
     _resetRateLimitForTest();
     const out2 = await buildMemoryContext("帮我回忆总线工程进度", { glueUrl: `http://127.0.0.1:${port}`, minIntervalMs: 0, maxChars: 1500 });
     assert.ok(out2 && out2.includes("真记忆一条"), "人类轮照常召回");
     assert.ok(seen.some((u) => u.includes("/recall")), "人类轮确实调了 /recall");
   } finally { srv.close(); }
+});
+
+console.log("== 2.11 注入第六刀：唤醒轮「只注回魂」（2026-09-21，dandan 17:50 亲批）==");
+
+ok("刀f：extractQueryInfo 区分三类——机器轮 / 人类轮 / 非人类轮（心跳等）", () => {
+  const hyg = resolveInjectHygiene({}, {});
+  const wake = "[Mon 2026-09-07 18:00 GMT+8] 🌙【梦中醒来】自主醒来（routine）：惊讶度 0.0 / 熵 0.00";
+  const a = extractQueryInfo(wake, hyg);
+  assert.equal(a.query, null, "剥净 → query null");
+  assert.equal(a.machineOnly, true, "剥净 = 机器轮（可走只注回魂）");
+  // 人类轮：即便含模板 token，剥完仍有残留 ⇒ 非机器轮
+  const b = extractQueryInfo("<|im_start|>你看这个文档<|im_end|>", hyg);
+  assert.equal(b.query, "你看这个文档");
+  assert.equal(b.machineOnly, false, "有人类线索 → 非机器轮");
+  // 非人类轮：心跳/子代理/跨会话 meta —— 不是机器轮（照旧不注入）
+  for (const p of ["heartbeat poll", "You are running as a subagent", "sourceSession=abc"]) {
+    const q = extractQueryInfo(p, hyg);
+    assert.equal(q.query, null, `${p} → null`);
+    assert.equal(q.machineOnly, false, `${p} → machineOnly 必须 false（别把非人类轮当唤醒轮）`);
+  }
+  // 向后兼容：hygiene 缺省 → 不剥（旧行为），无机器轮
+  const c = extractQueryInfo(wake, null);
+  assert.equal(c.machineOnly, false, "hygiene 缺省 = 旧行为");
+  // fail-open：非字符串不抛
+  assert.deepEqual(extractQueryInfo(123, hyg), { query: "", machineOnly: false });
+});
+
+ok("刀f：stripMachineNoiseFromSoul 剔机器噪音、保读数与人话（纯函数）", () => {
+  const t = "[回魂] 自述:【重理解】2026-09-21 16:03:01 [dandan] 原话: 等你三件｜我正同时唤起多个记忆，方向稳定。 / 状态:熵0.95 惊讶0.11 目的0.92 轮次7 / 景观:状态：不可判·熵饱和区（熵0.9998 / max|σ_act|0.93）｜缺口：fok/low_confidence 不可读（无 /soul 缺口字段）｜[信息性标注：熵高≠异常；替代量…] / <|im_start|>[记忆系统自述] 激活节点: 节点1172(强:0.9) / 最近:网关重载去做吧";
+  const out = stripMachineNoiseFromSoul(t);
+  for (const bad of ["【重理解】", "[记忆系统自述]", "激活节点:", "[信息性标注", "<|im_start|"]) {
+    assert.ok(!out.includes(bad), `机器噪音必须剔净：${bad}`);
+  }
+  for (const keep of ["[回魂]", "我正同时唤起多个记忆", "熵0.95", "惊讶0.11", "轮次7", "缺口：fok/low_confidence", "网关重载去做吧"]) {
+    assert.ok(out.includes(keep), `人可读部分必须保留：${keep}`);
+  }
+  // 异常输入 fail-open 不抛
+  assert.equal(stripMachineNoiseFromSoul(null), null);
+  assert.equal(stripMachineNoiseFromSoul(42), 42);
+});
+
+ok("刀f：resolveInjectHygiene.soulOnlyWake 默认 soul + 可回撤 off/full + 无效值回退", () => {
+  assert.equal(resolveInjectHygiene({}, {}).soulOnlyWake, "soul", "默认：只注回魂");
+  assert.equal(resolveInjectHygiene({}, { soulOnlyWake: "off" }).soulOnlyWake, "off", "什么都不注");
+  assert.equal(resolveInjectHygiene({}, { soulOnlyWake: "full" }).soulOnlyWake, "full", "全注");
+  assert.equal(resolveInjectHygiene({}, { soulOnlyWake: false }).soulOnlyWake, "off", "boolean false→off");
+  assert.equal(resolveInjectHygiene({}, { soulOnlyWake: true }).soulOnlyWake, "soul", "boolean true→soul");
+  assert.equal(resolveInjectHygiene({ INJECT_SOUL_ONLY_WAKE: "OFF" }, {}).soulOnlyWake, "off", "env 大小写不敏感");
+  assert.equal(resolveInjectHygiene({ INJECT_SOUL_ONLY_WAKE: "bad" }, {}).soulOnlyWake, "soul", "无效值→默认（fail-open：宁注回魂）");
+  assert.equal(resolveInjectHygiene({}, {}).stripMachineQuery, true, "第五刀成果不因新开关回退");
+});
+
+// 唤醒轮专用 mock：/soul（含机器语音+机器最近） + /landscape + /recall
+function startWakeMock() {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      seen.push(req.url);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url.includes("/soul")) {
+        res.end(JSON.stringify({
+          ok: true,
+          lms_voice: ["[记忆系统自述] 激活节点: 节点1172(强:0.95)", "我正同时唤起多个记忆，方向稳定。"],
+          lms_state: { entropy_ratio: 0.95, last_surprise: 0.11, purpose_coherence: 0.92, turn_count: 7 },
+          recent: [
+            { text: "【重理解】2026-09-21 16:03:01 [dandan] 原话: 等你三件" },
+            { text: "最近一条人话记忆：网关重载去做吧" },
+          ],
+        }));
+        return;
+      }
+      if (req.url.includes("/landscape")) {
+        res.end(JSON.stringify({ landscape: { num_nodes: 256, activation: { entropy_norm: 0.99, active_nodes: 253, top_activated: [{ node: 1, sigma: 0.93 }] } } }));
+        return;
+      }
+      const parsed = JSON.parse(body || "{}");
+      res.end(JSON.stringify({ query: parsed.query, count: 1, results: [{ id: "m", text: "真记忆一条", origin: "lms" }] }));
+    });
+  });
+  return new Promise((r) => server.listen(0, "127.0.0.1", () => r({ server, port: server.address().port, seen })));
+}
+const WAKE_PROMPT = "[Mon 2026-09-07 18:00 GMT+8] 🌙【梦中醒来】自主醒来（flatline：惊讶冻结 120 轮）：惊讶度 68.0（现值）/ 熵 7.34 | 激活节点: 节点1002(强:0.953)\n→ 我想:①待办盘点";
+
+await okAsync("刀f 集成：唤醒轮默认只注回魂（含状态/景观/最近；零机器噪音；零 /recall）", async () => {
+  const { server, port, seen } = await startWakeMock();
+  try {
+    _resetRateLimitForTest();
+    const out = await buildMemoryContext(WAKE_PROMPT, { glueUrl: `http://127.0.0.1:${port}`, lmsUrl: `http://127.0.0.1:${port}`, minIntervalMs: 0, maxChars: 1500 });
+    assert.ok(out && out.startsWith("[回魂]"), `应注回魂，实际 ${JSON.stringify(out)}`);
+    for (const keep of ["状态:熵0.95", "惊讶0.11", "轮次7", "最近:最近一条人话记忆"]) {
+      assert.ok(out.includes(keep), `回魂人可读部分缺失：${keep}`);
+    }
+    for (const bad of ["[记忆注入]", "【重理解】", "[记忆系统自述]", "激活节点:", "[行动]", "[信息性标注", "<|", "真记忆一条"]) {
+      assert.ok(!out.includes(bad), `机器噪音/记忆块不得进唤醒轮注入：${bad}`);
+    }
+    assert.ok(!seen.some((u) => u.includes("/recall")), `零 /recall（不污染 z 窗口），实际 ${JSON.stringify(seen)}`);
+    assert.ok(seen.some((u) => u.includes("/soul")), "回魂走 /soul");
+  } finally { server.close(); }
+});
+
+await okAsync("刀f 集成：开关 off → 唤醒轮零注入零请求；full → 退回头看（含 /recall 与记忆块）", async () => {
+  const { server, port, seen } = await startWakeMock();
+  try {
+    _resetRateLimitForTest();
+    const off = await buildMemoryContext(WAKE_PROMPT, { glueUrl: `http://127.0.0.1:${port}`, lmsUrl: `http://127.0.0.1:${port}`, minIntervalMs: 0, maxChars: 1500, soulOnlyWake: "off" });
+    assert.equal(off, null, "off = 第五刀行为（什么都不注）");
+    assert.equal(seen.length, 0, `off 时零请求，实际 ${JSON.stringify(seen)}`);
+    _resetRateLimitForTest();
+    const full = await buildMemoryContext(WAKE_PROMPT, { glueUrl: `http://127.0.0.1:${port}`, lmsUrl: `http://127.0.0.1:${port}`, minIntervalMs: 0, maxChars: 1500, soulOnlyWake: "full" });
+    assert.ok(full && full.includes("真记忆一条"), "full = 全注（含记忆块）");
+    assert.ok(seen.some((u) => u.includes("/recall")), "full 会召回（退旧行为）");
+  } finally { server.close(); }
+});
+
+await okAsync("刀f：剥净不崩——/soul 故障 → null；soulEnabled:false → null（不请求）", async () => {
+  const { server, port, seen } = await startWakeMock();
+  try {
+    _resetRateLimitForTest();
+    const dead = await buildMemoryContext(WAKE_PROMPT, { glueUrl: "http://127.0.0.1:1", lmsUrl: "http://127.0.0.1:1", minIntervalMs: 0, maxChars: 1500 });
+    assert.equal(dead, null, "回魂源不可达 → fail-open 不注入、不抛错");
+    _resetRateLimitForTest();
+    const s0 = seen.length;
+    const nosoul = await buildMemoryContext(WAKE_PROMPT, { glueUrl: `http://127.0.0.1:${port}`, lmsUrl: `http://127.0.0.1:${port}`, minIntervalMs: 0, maxChars: 1500, soulEnabled: false });
+    assert.equal(nosoul, null, "soulEnabled:false → 不注");
+    assert.equal(seen.length, s0, "soulEnabled:false → 不请求");
+  } finally { server.close(); }
 });
 
 console.log("== 3. index.js 接线测试（SDK shim，临时 node_modules）==");

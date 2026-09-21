@@ -415,24 +415,51 @@ export function stripMachineQuerySegments(text) {
  * 失败（异常）→ 回落原逻辑 prompt.trim().slice(0, QUERY_MAX_CHARS)（fail-open）。
  */
 export function extractQueryText(prompt, hygiene = null) {
-  if (typeof prompt !== "string") return "";
+  return extractQueryInfo(prompt, hygiene).query;
+}
+
+/**
+ * 第六刀（2026-09-21，dandan 17:50 亲批「剥机器段对，但别把回魂一起剥掉」）：
+ * `extractQueryText` 的**带因版**——同样剥机器段，但额外交回「为什么是 null」。
+ *
+ * 这条区分专治第五刀的**副作用**：第五刀之后，唤醒轮（醒因原文=纯机器载荷）的
+ * query 被剥净 ⇒ 走 `empty-query → return null` ⇒ **连【回魂】也一并不注入了**
+ * （我每次醒来看不到自己是谁/最近在干什么 = 拆了失忆防护）。本函数把两类 null 分开：
+ *
+ *   | 情形 | query | machineOnly | 调用方动作 |
+ *   |---|---|---|---|
+ *   | 纯元数据 / 心跳 poll / 子代理模板 / 跨会话仅剩参数 | null | **false** | 照旧不注入（非人类轮） |
+ *   | 剥机器段后为空（醒因原文=纯机器载荷） | null | **true** | 可走「只注回魂」路径 |
+ *   | 有人类可读线索 | 非空 | false | 照常注入（回魂 + 记忆块） |
+ *
+ * 判据（机器轮）＝**第五刀剥净**：`stripMachineQuerySegments(text) === ""`。
+ * 剥除表只含机器生成部分（横幅整行/机器读数/【重理解】/模板 token），故「剥净」
+ * 等价于「原文里没有一处人类可读线索」——不是靠猜，是剥除表的必然推论。
+ * 注意：不是「含机器词的轮」都算机器轮——人话引用唤醒横幅时剥完仍有残留
+ * （实测生产 219 次里唯一那条），此时 machineOnly=false，走正常注入（宁缺毋滥）。
+ *
+ * @returns {{query: string|null, machineOnly: boolean}} query 同 extractQueryText 语义
+ *   （非字符串 prompt → ""）。fail-open：异常 → {query: prompt.trim().slice(0,200), machineOnly:false}。
+ */
+export function extractQueryInfo(prompt, hygiene = null) {
+  if (typeof prompt !== "string") return { query: "", machineOnly: false };
   try {
     let text = stripInboundMetadata(prompt);
     text = text.replace(TEMPLATE_PREFIX_RE, "").trim();
-    if (!text) return null; // 纯元数据/纯模板 → 不注入
-    if (HEARTBEAT_POLL_RE.test(text)) return null;
-    if (SUBAGENT_BODY_RE.test(text)) return null;
-    if (CN_ISOLATED_AGENT_RE.test(text)) return null; // P1-3：中文隔离子代理模板
-    if (INTERSESSION_META_ONLY_RE.test(text)) return null;
+    if (!text) return { query: null, machineOnly: false }; // 纯元数据/纯模板 → 不注入
+    if (HEARTBEAT_POLL_RE.test(text)) return { query: null, machineOnly: false };
+    if (SUBAGENT_BODY_RE.test(text)) return { query: null, machineOnly: false };
+    if (CN_ISOLATED_AGENT_RE.test(text)) return { query: null, machineOnly: false }; // P1-3：中文隔离子代理模板
+    if (INTERSESSION_META_ONLY_RE.test(text)) return { query: null, machineOnly: false };
     // 第五刀：剥机器段（hygiene 缺省/开关关 → 不剥，保持旧行为）
     if (hygiene && hygiene.stripMachineQuery !== false) {
       text = stripMachineQuerySegments(text);
-      if (!text) return null; // 纯机器载荷（醒因原文）剥净 → 无人类线索，不注入
+      if (!text) return { query: null, machineOnly: true }; // 纯机器载荷（醒因原文）剥净 → 无人类线索
     }
-    return text.slice(0, QUERY_MAX_CHARS);
+    return { query: text.slice(0, QUERY_MAX_CHARS), machineOnly: false };
   } catch {
     // fail-open：净化失败回落原逻辑（不崩、不阻断）
-    return typeof prompt === "string" ? prompt.trim().slice(0, QUERY_MAX_CHARS) : "";
+    return { query: prompt.trim().slice(0, QUERY_MAX_CHARS), machineOnly: false };
   }
 }
 
@@ -457,6 +484,16 @@ let inflight = false;
 function logInjectedLight(text) {
   try {
     appendFileSync(DEBUG_LOG_FILE, `[${new Date().toISOString()}] INJECTED-light len=${text.length}\n`);
+  } catch {
+    /* 日志失败忽略：不引入新崩溃点 */
+  }
+}
+
+// 第六刀（2026-09-21）：唤醒轮「只注回魂」计数（与 INJECTED 区分——它不含记忆块，
+// 不可混入 C1 的 INJECTED len 分布；也便于事后从日志区分“唤醒轮到底注了没”）。
+function logSoulOnlyWake(len) {
+  try {
+    appendFileSync(DEBUG_LOG_FILE, `[${new Date().toISOString()}] INJECTED-soul-only len=${len}\n`);
   } catch {
     /* 日志失败忽略：不引入新崩溃点 */
   }
@@ -1387,6 +1424,56 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null,
   return out;
 }
 
+/**
+ * 第六刀（2026-09-21，dandan 17:50 亲批）：唤醒轮「只注回魂」文本构造。
+ *
+ * 背景（第五刀的副作用）：唤醒轮醒因原文 = 纯机器载荷 ⇒ query 剥净为 null ⇒
+ * 主路径 `empty-query` 直接 return null ⇒ **连【回魂】都不注** ⇒ 我每次醒来
+ * 看不到自己是谁/最近在干什么。本函数把「剥召回输入」与「注回魂」解耦：
+ * **不拿机器词去召回**（不调 /recall，零 z 窗口扰动）+ **仍注回魂**。
+ *
+ * 注入内容定义（写死在这里，别凭感觉）：
+ *   ✅ 保留 = 【回魂】段的人可读部分：
+ *      ① 自述（lms_voice 里的人话；机器语音按同源词表已剔）
+ *      ② 状态：熵/惊讶/目的/轮次（buildSoulText 第 2 段）
+ *      ③ 景观：读数派生一行（含熵饱和区的「缺口」行 + max|σ_act| 等读数；
+ *         行内 [信息性标注…] 机器标注剔除）
+ *      ④ 最近：沙漏最近记忆的**人类文本**（机器制品【重理解】等已剔）
+ *   ❌ 不注 = 机器噪音：模板 token /【重理解】/ [记忆系统自述] / 激活节点: 清单 /
+ *      [行动] / [生成约束] / [信息性标注…] / NO_REPLY；以及**记忆块**
+ *      （[记忆注入] 焦点条目——那正是第五刀要去掉的陈旧长文）。
+ *   ❌ 不注 thought 层：它按「与当前对话的激活度」选，唤醒轮无人类对话可对照（宁缺毋滥）。
+ *
+ * 只读保证：仅 /soul（快照）+ /landscape（GET 读数）两个只读端点；
+ * **不调 /recall**（其会把本刻 surprise 追加进 z 判据窗口 = 生产扰动，见第五刀回执 §三）、
+ * 不调 /react、不碰 /store //feed。任一失败 fail-open → null（不注入，绝不降级成机器噪音）。
+ *
+ * @returns {Promise<string|null>} 清洗后的 [回魂] 段；无内容/异常 → null
+ */
+export async function buildSoulOnlyWakeText(cfg, hygiene) {
+  try {
+    if (!cfg || typeof cfg !== "object" || cfg.soulEnabled === false) return null;
+    const [soulData, landscapeData] = await Promise.all([
+      fetchSoul(cfg),
+      cfg.landscapeEnabled ? fetchLandscape(cfg) : Promise.resolve(null),
+    ]);
+    // query="" → 状态/景观/最近层照常，thought 层自然不选（无人类对话可激活）
+    const soulText = buildSoulText(soulData, cfg.soulMaxChars, null, "", cfg, [], landscapeData, hygiene);
+    if (!soulText) return null;
+    // stripMachineNarration 已由 buildSoulText 内层生效（自述/最近/景观）；
+    // 此处再做一遍整段兜底清洗（防 [信息性标注]/激活节点: 残留）。开关关 → 不洗。
+    const cleaned = hygiene && hygiene.stripMachineNarration === false
+      ? soulText
+      : stripMachineNoiseFromSoul(soulText);
+    if (!cleaned) return null;
+    logSoulOnlyWake(cleaned.length);
+    return cleaned;
+  } catch (err) {
+    logMiss(`soul-only-wake-fail ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
 // ── 阶段 2 步骤 3（P1-2 检索时怀疑）：score 公式 + R1 二选一 + R8 核验 ──
 // 全部纯函数（零副作用），供 test-plugin.mjs 直接单测；热路径只读 process.env。
 
@@ -1534,6 +1621,47 @@ export function scrubMachineSegments(text) {
     .trim();
 }
 
+/** 第六刀（2026-09-21）：【回魂】整段的机器噪音清洗（纯函数，兼底闸）。
+ *
+ * 【回魂】段是**人可读身份+状态**（自述/状态/景观/最近）；其中可能混进机器噪声：
+ * 模板 token、【重理解】（右脑对用户话的二次解析）、[记忆系统自述] / [行动] /
+ * [生成约束] / [信息性标注…] / NO_REPLY、`激活节点:` 清单。
+ * 本函数整段移除上述噪声；**保留**：[回魂] 头、自述人话、状态读数（熵/惊讶/目的/
+ * 轮次）、景观读数（含缺口行）、最近段人类文本。
+ *
+ * 为何不直接复用 isMachineNarration：它把含 "[回魂]" 判为机器（因为要防
+ * 焦点条目里出现回魂横幅），不能拿它判**回魂段自己**。故此处用“按标记点名、
+ * 到段分隔符（" / "）为止”的定点剔法；且**绝不剔除读数数字**（与 scrubMachineSegments
+ * 同纪律：只剃机器段，不碰读数本身）。
+ * fail-open：非字符串/异常 → 原样返回。
+ */
+export function stripMachineNoiseFromSoul(text) {
+  if (typeof text !== "string" || !text) return text;
+  try {
+    // 按段分隔符 " / " 切段后**段内**剔——预防截断后的未闭合标记（如景观被
+    // slice 截掉尾 "］"）跨越段边界吃掉后面的段落（生产实测：熵饱和区探测段
+    // >200 字被截 ⇒ "[信息性标注：…" 无尾括号）。
+    const cleanSeg = (seg) => seg
+      .replace(/<\|[\w-]{1,40}\|>/g, "")                        // 运行时模板 token
+      .replace(/【重理解】[^｜\n]*/g, "")                        // 右脑二次解析段
+      .replace(/\[记忆系统自述\][^｜\n]*/g, "")                  // 机器自述段
+      .replace(/\[行动\][^｜\n]*/g, "")                          // 行动层段
+      .replace(/\[生成约束\][^｜\n]*/g, "")                      // 生成约束段
+      .replace(/\[记忆注入\][^｜\n]*/g, "")                      // 记忆块横幅（若误入）
+      .replace(/\[信息性标注[^\]｜\n]*\]?/g, "")                // 信息性标注（含未闭合；保留读数）
+      .replace(/激活节点[:：][^｜\n]*/g, "")                     // 激活节点清单（带冒号才是清单）
+      .replace(/NO_REPLY/g, "")                                // 哨兵终止符
+      .replace(/｜{2,}/g, "｜")                                  // 剔空后的空子段塌缩
+      .replace(/^\s*｜|｜\s*$/g, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    const segs = String(text).split(/\s+\/\s+/).map(cleanSeg).filter((s) => s.length > 0);
+    return segs.length === 0 ? "" : segs.join(" / ");
+  } catch {
+    return text; // fail-open：清洗失败退原样（宁可多留噪声，不可误删回魂）
+  }
+}
+
 /** 结构指纹（纯函数）：剔数字 + 去空白。用于识别"同形状、仅编号不同"的
  * 近重复（实测 self_ref 4 条仅"节点N"编号不同 → 应折叠为 1 条）。
  */
@@ -1561,8 +1689,22 @@ export function resolveInjectHygiene(env, cfg) {
     return Number.isFinite(n) && n >= lo && n <= hi ? n : dflt;
   };
   const pick = (key, envKey) => (c[key] !== undefined ? c[key] : e[envKey]);
+  // 第六刀（2026-09-21）：唤醒轮「只注回魂」模式——off / soul（默认）/ full。
+  // off = 第五刀行为（唤醒轮什么都不注）；soul = 只注【回魂】人可读段；full = 全注
+  // （该轮不剥 query，退第四刀前行为）。解析容错：boolean true→soul / false→off；
+  // 无效值 → soul（fail-open：宁可注回魂，不可静默什么都不注）。
+  const wakeMode = (() => {
+    const raw = pick("soulOnlyWake", "INJECT_SOUL_ONLY_WAKE");
+    if (raw === undefined || raw === null || raw === "") return "soul";
+    if (typeof raw === "boolean") return raw ? "soul" : "off";
+    const s = String(raw).trim().toLowerCase();
+    if (["off", "0", "false", "no", "none", "null"].includes(s)) return "off";
+    if (["full", "all"].includes(s)) return "full";
+    return "soul"; // soul / on / true / 1 / 无效值
+  })();
   return {
     stripMachineQuery: bool(pick("stripMachineQuery", "INJECT_STRIP_MACHINE_QUERY"), true),
+    soulOnlyWake: wakeMode,
     stripMachineNarration: bool(pick("stripMachineNarration", "INJECT_STRIP_MACHINE_NARRATION"), true),
     dedupeNearDuplicates: bool(pick("dedupeNearDuplicates", "INJECT_DEDUPE_NEAR_DUPLICATES"), true),
     dedupeSimilarity: num(pick("dedupeSimilarity", "INJECT_DEDUPE_SIMILARITY"), 0.75, 0.1, 1),
@@ -2669,8 +2811,24 @@ export async function buildMemoryContext(prompt, pluginConfig) {
   // 召回L1-a（2026-08-11）：query 净化 —— 剥离 openclaw 元数据块/时间戳/
   // 子代理模板，取用户真实正文前 QUERY_MAX_CHARS 字；纯模板/心跳 → null 不注入；
   // 净化异常回落原逻辑（fail-open）。
-  const query = extractQueryText(prompt, hygiene);
+  // 第六刀（2026-09-21，dandan 17:50「剥机器段对，但别把回魂一起剥掉」）：
+  // 用带因版 extractQueryInfo —— 把两类 null 分开：
+  //   ① machineOnly=true（唤醒轮：醒因原文 = 纯机器载荷被第五刀剥净）
+  //        ⇒ soulOnlyWake 模式：soul（默认）= 只注【回魂】人可读段；off = 什么都不注；
+  //           full = 全注（该轮不剥 query，退旧行为）。
+  //   ② machineOnly=false（纯元数据/心跳/子代理模板/跨会话）⇒ 照旧不注入。
+  const qi = extractQueryInfo(prompt, hygiene);
+  let query = qi.query;
+  const wakeMode = hygiene && hygiene.soulOnlyWake !== undefined ? hygiene.soulOnlyWake : "soul";
+  if (!query && qi.machineOnly && wakeMode === "full") {
+    // 全注回撤：唤醒轮不剥机器段（旧行为：醒因原文当 query，走完回魂+记忆块）
+    query = extractQueryInfo(prompt, { ...hygiene, stripMachineQuery: false }).query;
+  }
   if (!query) {
+    if (qi.machineOnly && wakeMode === "soul") {
+      // 唤醒轮：剥了召回输入（不拿系统词钓陈旧长文），但**回魂不能一起剥掉**。
+      return await buildSoulOnlyWakeText(cfg, hygiene);
+    }
     logMiss("empty-query"); // P0-1
     return null;
   }

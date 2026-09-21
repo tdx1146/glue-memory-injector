@@ -43,7 +43,13 @@
       "stripMachineQuery": {
         "type": "boolean",
         "default": true,
-        "description": "注入瘦身·刀e（2026-09-21）：召回**输入面**剥机器段——醒因/载荷文本进 extractQueryText 前去掉唤醒横幅/自主醒来（…）/惊讶度/熵/激活节点/【重理解】/模板 token，只留人类可读线索；剥净则不注入（不再用系统词钓 8 月陈旧长文）；false=退旧行为"
+        "description": "注入瘦身·刀e（2026-09-21）：召回**输入面**剥机器段——醒因/载荷文本进 extractQueryText 前去掉唤醒横幅/自主醒来（…）/惊讶度/熵/激活节点/【重理解】/模板 token，只留人类可读线索；剥净则不召回（不再用系统词钓 8 月陈旧长文）；false=退旧行为"
+      },
+      "soulOnlyWake": {
+        "type": "string",
+        "enum": ["off", "soul", "full"],
+        "default": "soul",
+        "description": "注入第六刀（2026-09-21）：唤醒轮（醒因原文 = 纯机器载荷、第五刀剥净）怎么办——soul（默认）= 剥召回输入但仍注【回魂】人可读段（自述/状态/景观·含缺口/最近人类文本），不注机器噪音（[记忆系统自述]/激活节点:/[行动]/[信息性标注]/【重理解】/模板 token）、不调 /recall；off = 什么都不注（第五刀行为）；full = 全注（该轮不剥 query，退旧行为）。兼容布尔：true→soul / false→off；env INJECT_SOUL_ONLY_WAKE 同义"
       },
       "stripMachineNarration": {
         "type": "boolean",
