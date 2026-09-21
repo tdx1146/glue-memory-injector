@@ -58,6 +58,8 @@ const {
   recencyFactor,
   truncateEntryText,
   dedupeNearDuplicateItems,
+  stripMachineQuerySegments,
+  extractQueryText,
 } = await import("./memory-recall.js");
 
 let passed = 0;
@@ -2135,6 +2137,103 @@ await okAsync("端到端：buildMemoryContext 默认开四刀 → 机器条目�
   } finally {
     server.close();
   }
+});
+
+console.log("== 2.10 注入第五刀：召回输入面机器段剥离（2026-09-21）==");
+
+ok("刀e：唤醒横幅整行剥净（🌙【梦中醒来】/自主醒来（…）/惊讶度/熵/激活节点/→ 我想:）", () => {
+  const wake = "🌙【梦中醒来】自主醒来（flatline：惊讶冻结 120 轮（z 全 ≤ 0）｜待办 68 条未清（发生于 0 分钟前））：惊讶度 68.0（现值）/ 熵 7.34 | 当前记忆处于高唤醒状态，多个记忆模式同时激活 | 当前关注方向稳定 | 激活节点: 节点1002(强:0.953), 节点260(强:0.947)\n→ 我想:①待办盘点：V2 迁移中断续跑 —— 或做你自己此刻想做的事";
+  const out = stripMachineQuerySegments(wake);
+  assert.equal(out, "", `醒因原文应剥净，实际 ${JSON.stringify(out)}`);
+  for (const bad of ["梦中醒来", "自主醒来", "惊讶度", "激活节点", "我想"] ) {
+    assert.ok(!out.includes(bad), `不得残留机器段：${bad}`);
+  }
+});
+
+ok("刀e：模板 token / 【重理解】 / 我听到的是 剥离，人话线索保留", () => {
+  assert.equal(stripMachineQuerySegments("<|im_start|>你看这个文档<|im_end|>"), "你看这个文档");
+  assert.equal(stripMachineQuerySegments("你的意思是：【重理解】2026-09-21 16:03:01 [dandan] 原话: 等你三件 我听到的是“…”"), "你的意思是：");
+  // 人话（不带机器标点）不得被误剥
+  assert.equal(stripMachineQuerySegments("帮我看看回魂仪式那套还在跑吗"), "帮我看看回魂仪式那套还在跑吗");
+  assert.equal(stripMachineQuerySegments("为什么惊讶度这么高？"), "为什么惊讶度这么高？", "无数字=非机器形状，不剥");
+});
+
+ok("刀e：括号配平（嵌套/截断）+ 人类前缀保留", () => {
+  assert.equal(stripMachineQuerySegments("前缀 自主醒来（a（b）c） 后缀"), "前缀 后缀");
+  assert.equal(stripMachineQuerySegments("前缀 自主醒来（a（b 尾巴"), "前缀", "括号不平衡→吃到行尾");
+  const human = "18点的时候，你发过这个给自己：\n🌙【梦中醒来】自主醒来（routine 闹钟兜底）：惊讶度 0.0 / 熵 0.00";
+  assert.equal(stripMachineQuerySegments(human), "18点的时候，你发过这个给自己：", "人写的那行必须保留");
+});
+
+ok("刀e：词表单一来源——【重理解】进 MACHINE_NARRATION_MARKERS（焦点侧同源）", () => {
+  assert.equal(isMachineNarration("【重理解】2026-09-21 16:03:01 [dandan] 原话: 等你三件"), true);
+  assert.equal(isMachineNarration("等你三件事：把回执发我"), false, "人话不得误判");
+});
+
+ok("刀e：extractQueryText 开关/向后兼容/fail-open", () => {
+  const wake = "[Mon 2026-09-07 18:00 GMT+8] 🌙【梦中醒来】自主醒来（routine）：惊讶度 0.0 / 熵 0.00";
+  // hygiene 缺省 = 旧行为零变化（直接单测不受影响）
+  assert.ok(String(extractQueryText(wake)).includes("🌙【梦中醒来】"), "缺省不剥（老行为）");
+  const hyg = resolveInjectHygiene({}, {});
+  assert.equal(extractQueryText(wake, hyg), null, "剥净→null（不注入）");
+  // 开关关 → 退旧行为
+  assert.ok(String(extractQueryText(wake, { stripMachineQuery: false })).includes("🌙【梦中醒来】"));
+  // 人类正文照常召回
+  assert.equal(extractQueryText("[Mon 2026-09-21 09:00 GMT+8] 帮我看看回魂仪式还在跑吗", hyg), "帮我看看回魂仪式还在跑吗");
+  // fail-open：异常输入不抛
+  let ok2 = true;
+  try { stripMachineQuerySegments(null); stripMachineQuerySegments(123); } catch { ok2 = false; }
+  assert.ok(ok2, "非字符串/异常不得抛错（fail-open）");
+});
+
+ok("刀e：resolveInjectHygiene 新字段默认开 + 可关 + 无效值回退", () => {
+  assert.equal(resolveInjectHygiene({}, {}).stripMachineQuery, true, "默认开");
+  assert.equal(resolveInjectHygiene({}, { stripMachineQuery: false }).stripMachineQuery, false, "config 优先");
+  assert.equal(resolveInjectHygiene({ INJECT_STRIP_MACHINE_QUERY: "0" }, {}).stripMachineQuery, false, "env='0' 关");
+  assert.equal(resolveInjectHygiene({ INJECT_STRIP_MACHINE_QUERY: "bad" }, {}).stripMachineQuery, true, "无效值→默认");
+});
+
+ok("刀e：最近: 段机器制品（【重理解】）不进注入，人话最近保留", () => {
+  const soul = {
+    lms_voice: [],
+    lms_state: { entropy_ratio: 0.9 },
+    recent: [
+      { text: "【重理解】2026-09-21 16:03:01 [dandan] 原话: 等你三件" },
+      { text: "真·最近记忆：网关重载去做吧" },
+    ],
+  };
+  const off = buildSoulText(soul, 800, null, "", null, null, null, null);
+  assert.ok(off.includes("【重理解】"), "旧行为：机器制品进注入");
+  const on = buildSoulText(soul, 800, null, "", null, null, null, resolveInjectHygiene({}, {}));
+  assert.ok(!on.includes("【重理解】"), "开刀后：机器制品不出现在注入");
+  assert.ok(on.includes("真·最近记忆"), "人话最近保留");
+});
+
+await okAsync("刀e 集成：唤醒轮不召回（零请求）；人类轮照常召回", async () => {
+  const seen = [];
+  const srv = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      seen.push(req.url);
+      if (req.url.includes("/soul")) { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: true })); return; }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ query: JSON.parse(body || "{}").query, count: 1, results: [{ id: "m", text: "真记忆一条", origin: "lms" }] }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const port = srv.address().port;
+  try {
+    _resetRateLimitForTest();
+    const wake = "[Mon 2026-09-07 18:00 GMT+8] 🌙【梦中醒来】自主醒来（routine）：惊讶度 0.0 / 熵 0.00";
+    const out = await buildMemoryContext(wake, { glueUrl: `http://127.0.0.1:${port}`, minIntervalMs: 0, maxChars: 1500 });
+    assert.equal(out, null, "唤醒轮不注入");
+    assert.equal(seen.length, 0, `唤醒轮不得发起召回请求，实际 ${JSON.stringify(seen)}`);
+    _resetRateLimitForTest();
+    const out2 = await buildMemoryContext("帮我回忆总线工程进度", { glueUrl: `http://127.0.0.1:${port}`, minIntervalMs: 0, maxChars: 1500 });
+    assert.ok(out2 && out2.includes("真记忆一条"), "人类轮照常召回");
+    assert.ok(seen.some((u) => u.includes("/recall")), "人类轮确实调了 /recall");
+  } finally { srv.close(); }
 });
 
 console.log("== 3. index.js 接线测试（SDK shim，临时 node_modules）==");

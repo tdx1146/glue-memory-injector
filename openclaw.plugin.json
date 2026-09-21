@@ -40,6 +40,11 @@
         "default": 1500,
         "description": "注入上下文文本上限（字符），防爆上下文"
       },
+      "stripMachineQuery": {
+        "type": "boolean",
+        "default": true,
+        "description": "注入瘦身·刀e（2026-09-21）：召回**输入面**剥机器段——醒因/载荷文本进 extractQueryText 前去掉唤醒横幅/自主醒来（…）/惊讶度/熵/激活节点/【重理解】/模板 token，只留人类可读线索；剥净则不注入（不再用系统词钓 8 月陈旧长文）；false=退旧行为"
+      },
       "stripMachineNarration": {
         "type": "boolean",
         "default": true,

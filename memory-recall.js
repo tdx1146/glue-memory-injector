@@ -297,14 +297,124 @@ export function stripInboundMetadata(text) {
     .replace(LEADING_TIMESTAMP_PREFIX_RE, "");
 }
 
+// ── 第五刀（2026-09-21）：召回**输入面**机器段剥离 ────────────────────────
+// 现场（2026-09-21 16:14 一次真实醒来）：焦点记忆 5 条全是 8 月"自主醒来没反应"
+// 长文（各数百字），与本次醒因（"惊讶突变 z=2.3"）话题像、时效废。根驱动——
+// **召回 query = 醒因原文**：`🌙【梦中醒来】自主醒来（…）：惊讶度… / 熵… |
+// 当前记忆处于… | 激活节点:…⏎→ 我想:…` ⇒ "自主醒来/唤醒"这类**系统词**被当成
+// 检索主题，每次醒来都钓回同一批 8 月长文（上一单四刀治的是**消费端**排序/去重，
+// 治不了输入面这个根驱动）。
+// 药：文本进 extractQueryText 前先剥**机器生成部分**，只留人类可读线索；
+// **剥净（纯机器载荷）→ 无人类线索 → 不注入**（与心跳/子代理同路径）。
+// 词表单一来源：与 `lms-core/message_markers.py` 的 PREFIX_MARKERS /
+// PRODUCER_PAYLOADS / SOURCE_LABEL_PREFIXES 语义对齐（跨语言不 import，此处登记
+// 同一批字面量；新增标记先在该 py 与此处同步，防字面漂移）。
+const QUERY_MACHINE_LINE_PREFIXES = [
+  // 唤醒通知横幅（message_markers: PREFIX_MARKERS 的三条生产者横幅）
+  "🌙【梦中醒来】", "📬【信箱新消息】", "【信箱·新留言】",
+  // 注入段横幅（同 PREFIX_MARKERS / SOURCE_LABEL_PREFIXES 的 [回魂] 族）
+  "[回魂]", "[行动]", "[信息性标注", "[记忆注入]", "[记忆系统自述]",
+  "[wake-bridge]", "[lms-memory]", "[心跳]", "[系统]", "[cron:",
+  "[Subagent Context]", "[Inter-session message]",
+];
+// self_pulse 载荷续行（PRODUCER_PAYLOADS 同款模板：`\n→ 我想:`）——机器自己拼的
+// 悬案续写，**内含它引用的旧用户原话**（正是"看着像人话、其实是机器拼的"污染源）。
+const QUERY_MACHINE_LINE_RE = /^(?:→|->)\s*我想[:：]/;
+// 运行时模板 token（`<|im_start|>` / `<|im_end|>` / `<|endoftext|>` 等）——非人话。
+const TEMPLATE_TOKEN_RE = /<\|[\w-]{1,40}\|>/g;
+// 机器自述段（右脑【重理解】= 机器对用户话的二次解析，**非用户原话**）：整段剔除。
+// 单一来源：message_markers.py 的 PRODUCER_PAYLOADS/SOURCE_LABEL_PREFIXES 同族。
+const MACHINE_SEGMENT_RES = [
+  /【重理解】[^\n]*/g,
+  // 重理解续行（右脑第一人称转述）：要求机器形状的标点（实测三型“我听到的是“…”/“，”/“：”）
+  /我听到的是\s*[:：，,“][^\n]*/g,
+];
+// 行内机器读数段（系统词）：只在"惊讶度/熵 + 数字"这种机器形状上生效——
+// 人话"为什么惊讶度这么高？"（无数字）不受影响（宁缺毋滥）。
+const MACHINE_INLINE_READING_RES = [
+  /惊讶度\s*[\d.]+[^｜|\n]*/g,
+  /熵\s*[\d.]+[^｜|\n]*/g,
+  /激活节点[:：][^\n]*/g,
+  /当前记忆处于[^｜|\n]*/g,
+  /当前关注方向[^｜|\n]*/g,
+  /多个记忆模式同时激活/g,
+  /发生于\s*\d+\s*分钟前/g,
+];
+
+/** 机器横幅行判定（纯函数）：行首是唤醒/注入横幅或 self_pulse 续行 → true。
+ * 按**行首前缀**判（人在句中“提到”这些标记不受影响，宁缺毋滥）。
+ */
+function isMachineQueryLine(line) {
+  const t = String(line).trim();
+  if (!t) return false;
+  if (QUERY_MACHINE_LINE_RE.test(t)) return true;
+  return QUERY_MACHINE_LINE_PREFIXES.some((p) => t.startsWith(p));
+}
+
+/** 剥掉 marker 后的**配平括号段**（含嵌套；括号不平衡=截断 → 吃到行尾）。
+ * 用于 "自主醒来（…（…）…）" 这类带嵌套括号的机器令牌；找不到 marker 原样返回。
+ */
+function stripBalancedAfter(text, marker) {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const idx = text.indexOf(marker, i);
+    if (idx === -1) { out += text.slice(i); break; }
+    out += text.slice(i, idx);
+    let j = idx + marker.length;
+    let depth = 1; // marker 末尾已含一个左括号
+    while (j < text.length && depth > 0) {
+      const ch = text[j];
+      if (ch === "（" || ch === "(") depth += 1;
+      else if (ch === "）" || ch === ")") depth -= 1;
+      j += 1;
+    }
+    if (depth > 0) { // 不平衡（被截断）→ 吃到行尾，避免残留半截
+      const nl = text.indexOf("\n", j);
+      j = nl === -1 ? text.length : nl;
+    }
+    i = j;
+  }
+  return out;
+}
+
+/** 召回输入面机器段剥离（纯函数，第五刀）。剥四类：
+ *   ① 模板 token（`<|im_start|>` 等）
+ *   ② 机器自述段（【重理解】/我听到的是 到行尾）
+ *   ③ 机器**横幅整行**（唤醒通知/注入段横幅/`→ 我想:` 续行）
+ *   ④ 行内机器读数段（惊讶度/熵/激活节点/自主醒来（…）…）
+ * 返回**人类可读线索**（空白归一 + trim）；剥净 → 返回 ""（调用方据此不注入）。
+ * fail-open：非字符串/异常 → 原样返回（绝不阻断注入）。
+ */
+export function stripMachineQuerySegments(text) {
+  if (typeof text !== "string" || !text) return text;
+  try {
+    let out = text.replace(TEMPLATE_TOKEN_RE, " ");
+    for (const re of MACHINE_SEGMENT_RES) out = out.replace(re, " ");
+    out = out
+      .split(/\r?\n/)
+      .filter((line) => !isMachineQueryLine(line))
+      .join("\n");
+    out = stripBalancedAfter(out, "自主醒来（");
+    out = stripBalancedAfter(out, "自主醒来(");
+    for (const re of MACHINE_INLINE_READING_RES) out = out.replace(re, " ");
+    return out.replace(/[｜|]+/g, " ").replace(/\s+/g, " ").trim();
+  } catch {
+    return text; // fail-open：清洗失败退旧行为（原文进召回）
+  }
+}
+
 /**
  * 从完整 prompt 提取用户真实正文作为检索 query（召回L1-a）。
  * 先 stripInboundMetadata（元数据/时间戳），再剥 [Subagent Context]/[Subagent
  * Task]/[Inter-session message] 模板前缀；剥离后为空 / 心跳 poll / 子代理
  * 指令正文 / 跨会话仅剩来源参数 → 返回 null（不注入）。
+ * 第五刀（2026-09-21）：再剥机器段（stripMachineQuerySegments）——唤醒轮不再用
+ * 醒因原文（系统词）当检索主题；**剥净 → null 不注入**。开关 hygiene.stripMachineQuery
+ * （默认开；hygiene 缺省 null = 旧行为零变化，向后兼容）。
  * 失败（异常）→ 回落原逻辑 prompt.trim().slice(0, QUERY_MAX_CHARS)（fail-open）。
  */
-export function extractQueryText(prompt) {
+export function extractQueryText(prompt, hygiene = null) {
   if (typeof prompt !== "string") return "";
   try {
     let text = stripInboundMetadata(prompt);
@@ -314,6 +424,11 @@ export function extractQueryText(prompt) {
     if (SUBAGENT_BODY_RE.test(text)) return null;
     if (CN_ISOLATED_AGENT_RE.test(text)) return null; // P1-3：中文隔离子代理模板
     if (INTERSESSION_META_ONLY_RE.test(text)) return null;
+    // 第五刀：剥机器段（hygiene 缺省/开关关 → 不剥，保持旧行为）
+    if (hygiene && hygiene.stripMachineQuery !== false) {
+      text = stripMachineQuerySegments(text);
+      if (!text) return null; // 纯机器载荷（醒因原文）剥净 → 无人类线索，不注入
+    }
     return text.slice(0, QUERY_MAX_CHARS);
   } catch {
     // fail-open：净化失败回落原逻辑（不崩、不阻断）
@@ -1239,12 +1354,17 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null,
   }
 
   // 4. 最近（沙漏最新记忆）：去重 + 最多 2 条（放 thought 之后=截断时先丢）
+  //    第五刀（2026-09-21）：机器制品不进注入——现场"最近:"段出现
+  //    `【重理解】2026-09-21 16:03:01 [dandan] 原话: …`（机器对用户话的重理解，
+  //    虽带来源标签、不冒充用户，但属机器制品）。词表同源（isMachineNarration）。
   const recents = Array.isArray(data.recent)
     ? data.recent.filter((r) => r && typeof r.text === "string" && r.text.trim())
     : [];
   const uniqRecents = [];
   const seenR = new Set();
   for (const r of recents) {
+    if (hygiene && typeof hygiene === "object" && hygiene.stripMachineNarration
+        && isMachineNarration(r.text)) continue; // 机器制品（【重理解】等）跳过
     const t = r.text.trim().replace(/\s+/g, " ");
     if (!seenR.has(t)) { seenR.add(t); uniqRecents.push(t); }
     if (uniqRecents.length >= 2) break;
@@ -1383,6 +1503,10 @@ const MACHINE_NARRATION_MARKERS = [
   "[wake-bridge]", "[lms-memory]", "[心跳]",
   "[Subagent Context]", "[Inter-session message]", "[cron:",
   "取代先前的快照", "你是思考链的【后台思考者】",
+  // 第五刀（2026-09-21）：右脑【重理解】= 机器对用户话的**二次解析**（机器制品，
+  // 虽带 [dandan] 来源标签也**不冒充用户原话**）——现场它仍占注入位（`最近:【重理解】…`）。
+  // 单一来源：与 message_markers.py 的 PRODUCER_PAYLOADS 同族（重理解产出）。
+  "【重理解】",
 ];
 
 /** 机器自述判定（纯函数）：条目/自述文本是否机器产物（非人类原话）。
@@ -1438,6 +1562,7 @@ export function resolveInjectHygiene(env, cfg) {
   };
   const pick = (key, envKey) => (c[key] !== undefined ? c[key] : e[envKey]);
   return {
+    stripMachineQuery: bool(pick("stripMachineQuery", "INJECT_STRIP_MACHINE_QUERY"), true),
     stripMachineNarration: bool(pick("stripMachineNarration", "INJECT_STRIP_MACHINE_NARRATION"), true),
     dedupeNearDuplicates: bool(pick("dedupeNearDuplicates", "INJECT_DEDUPE_NEAR_DUPLICATES"), true),
     dedupeSimilarity: num(pick("dedupeSimilarity", "INJECT_DEDUPE_SIMILARITY"), 0.75, 0.1, 1),
@@ -2544,7 +2669,7 @@ export async function buildMemoryContext(prompt, pluginConfig) {
   // 召回L1-a（2026-08-11）：query 净化 —— 剥离 openclaw 元数据块/时间戳/
   // 子代理模板，取用户真实正文前 QUERY_MAX_CHARS 字；纯模板/心跳 → null 不注入；
   // 净化异常回落原逻辑（fail-open）。
-  const query = extractQueryText(prompt);
+  const query = extractQueryText(prompt, hygiene);
   if (!query) {
     logMiss("empty-query"); // P0-1
     return null;
