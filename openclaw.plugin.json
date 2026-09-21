@@ -40,6 +40,68 @@
         "default": 1500,
         "description": "注入上下文文本上限（字符），防爆上下文"
       },
+      "stripMachineNarration": {
+        "type": "boolean",
+        "default": true,
+        "description": "注入瘦身·刀a（2026-09-21）：剔机器自述（[记忆系统自述]/激活节点/[行动]/[信息性标注…]/NO_REPLY/唤醒横幅）不注入；false=退旧行为"
+      },
+      "dedupeNearDuplicates": {
+        "type": "boolean",
+        "default": true,
+        "description": "注入瘦身·刀b（2026-09-21）：一次注入内同段/同指纹只留一份（治 [记忆系统自述] 重复 N 遍）；false=关"
+      },
+      "dedupeSimilarity": {
+        "type": "number",
+        "minimum": 0.1,
+        "maximum": 1,
+        "default": 0.75,
+        "description": "刀b：数字归一化 bigram Jaccard 近重复阈值"
+      },
+      "dedupeMinSharedChars": {
+        "type": "integer",
+        "minimum": 4,
+        "maximum": 400,
+        "default": 24,
+        "description": "刀b：共享连续子串长度阈值（长文整段复制）"
+      },
+      "entryTruncate": {
+        "type": "boolean",
+        "default": true,
+        "description": "注入瘦身·刀c（2026-09-21）：单条超长截断（保头+尾，不改原文存档）；false=关"
+      },
+      "entryMaxChars": {
+        "type": "integer",
+        "minimum": 40,
+        "maximum": 4000,
+        "default": 400,
+        "description": "刀c：单条焦点记忆注入上限（字符）"
+      },
+      "entryTruncateTailChars": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 400,
+        "default": 60,
+        "description": "刀c：截断时保留的尾部字符数（保留结论）"
+      },
+      "recencyWeight": {
+        "type": "boolean",
+        "default": true,
+        "description": "注入瘦身·刀d（2026-09-21）：召回排序引入时效项（老条目降权、非禁止）；false=关"
+      },
+      "recencyHalfLifeDays": {
+        "type": "number",
+        "minimum": 0.5,
+        "maximum": 3650,
+        "default": 14,
+        "description": "刀d：时效半衰天数（f=hl/(hl+ageDays)）"
+      },
+      "recencyFloor": {
+        "type": "number",
+        "minimum": 0.01,
+        "maximum": 1,
+        "default": 0.25,
+        "description": "刀d：时效降权地板（保证旧≠消失；旧条仅至多降到该系数）"
+      },
       "storeTurn": {
         "type": "object",
         "additionalProperties": false,

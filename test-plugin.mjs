@@ -50,6 +50,14 @@ const {
   applyLowTrustPolicy,
   _resetRateLimitForTest,
   _getRateLimitStateForTest,
+  isMachineNarration,
+  scrubMachineSegments,
+  narrationFingerprint,
+  resolveInjectHygiene,
+  parseEntryTimestamp,
+  recencyFactor,
+  truncateEntryText,
+  dedupeNearDuplicateItems,
 } = await import("./memory-recall.js");
 
 let passed = 0;
@@ -1895,6 +1903,187 @@ await okAsync("handleAgentEnd：INTERSESSION 轮 → 模式 B 跳过（空 user_
     // 绝不发空 user_input 的必败请求（旧代码每次必 400、从未落库）。
     assert.equal(state.requests.length, 0, "模式 B 不得写入（空 user_input 会被承接方 400）");
   } finally { server.close(); }
+});
+
+console.log("== 2.9 注入瘦身四刀（2026-09-21）==");
+
+ok("cut a：isMachineNarration 机器产物判定（词表与 message_markers.py 对齐）", () => {
+  // 机器产物 → true
+  assert.equal(isMachineNarration("[记忆系统自述] 当前记忆处于高唤醒状态"), true);
+  assert.equal(isMachineNarration("用户: [回魂] 状态:熵1.00 惊讶22.08 轮次234"), true);
+  assert.equal(isMachineNarration("激活节点: 节点7(强:0.954), 节点360(强:0.949)"), true);
+  assert.equal(isMachineNarration("[行动] 暂缓意向：该做:请主线只读核 doubt"), true);
+  assert.equal(isMachineNarration("景观:…｜[信息性标注：熵高≠异常…]"), true);
+  assert.equal(isMachineNarration("NO_REPLY"), true);
+  assert.equal(isMachineNarration("18点的时候，你发过这个给自己： 🌙【梦中醒来】自主醒来（routine 闹钟兜底）"), true);
+  assert.equal(isMachineNarration("📬【信箱新消息】见 /tmp/mailbox-inbox.txt"), true);
+  // 人话 → false
+  assert.equal(isMachineNarration("用户: 全部清理完成，然后呢就不说话了？ 还有一晚上过去了"), false);
+  assert.equal(isMachineNarration("回魂仪式步骤吧，同样的方法论去操作"), false, "讨论回魂（无方括号横幅）是人话，不得误杀");
+  // 空/非串 → true（无注入价值）
+  assert.equal(isMachineNarration(""), true);
+  assert.equal(isMachineNarration(null), true);
+});
+
+ok("cut a：scrubMachineSegments 剃掉 [信息性标注…] 段、保留读数", () => {
+  const src = "景观:状态：不可判（熵0.9999 / 激活1536/1536）｜[信息性标注：熵高≠异常；替代量 暂无⇒不可判]";
+  const out = scrubMachineSegments(src);
+  assert.ok(!out.includes("[信息性标注"), "标注段应被剃除");
+  assert.ok(out.includes("熵0.9999") && out.includes("激活1536/1536"), "读数必须保留");
+  assert.ok(!out.includes("｜｜") && !out.endsWith("｜"), "多余分隔符应收拾");
+});
+
+ok("cut c：truncateEntryText 超长截头+尾、不超上限、不动短文本", () => {
+  const short = "短条目";
+  assert.equal(truncateEntryText(short, 400, 60), short, "未超上限不改");
+  const long = "头".repeat(500) + "结论在此";
+  const t = truncateEntryText(long, 400, 60);
+  assert.ok(t.length <= 400, `截断后 ≤400，实际 ${t.length}`);
+  assert.ok(t.includes("…"), "应含截断标记");
+  assert.ok(t.endsWith("结论在此"), "保留尾部结论");
+  assert.ok(t.startsWith("头头头"), "保留头部");
+});
+
+ok("cut d：parseEntryTimestamp + recencyFactor（老降权、新不降、无时间中性）", () => {
+  // lms 条目：unix 秒
+  assert.equal(parseEntryTimestamp({ ts: 1787725641 }), 1787725641 * 1000);
+  // >1e12 视为毫秒
+  assert.equal(parseEntryTimestamp({ ts: 1787725641000 }), 1787725641000);
+  // 字符串日期
+  const s = parseEntryTimestamp({ ts: "2026-08-11 05:32:42" });
+  assert.ok(Number.isFinite(s) && new Date(s).getFullYear() === 2026, "字符串日期可解析");
+  // 文本内日期回退
+  const f = parseEntryTimestamp({ ts: null, text: "[Fri 2026-08-07 14:13 GMT+8] 活着吗" });
+  assert.ok(Number.isFinite(f), "文本内日期可回退解析");
+  // 全无 → null
+  assert.equal(parseEntryTimestamp({ ts: null, text: "无日期文本" }), null);
+  const now = Date.parse("2026-09-21T10:45:00+08:00");
+  assert.equal(recencyFactor(null, now, 14, 0.25), 1, "无时间戳 → 中性 1");
+  const fresh = recencyFactor(now - 3600 * 1000, now, 14, 0.25);
+  const old = recencyFactor(now - 60 * 86400000, now, 14, 0.25);
+  assert.ok(fresh > old, "新条目权重 > 老条目（降权生效）");
+  assert.ok(Math.abs(old - 0.25) < 1e-9, "极老条目落到地板 0.25（降权非禁止）");
+  assert.ok(fresh <= 1 && fresh > 0.95, "极新条目≈1");
+});
+
+ok("cut b：dedupeNearDuplicateItems 同段只留一份（保留高分）+ 同指纹折叠", () => {
+  const items = [
+    { text: "用户: 全部清理完成，然后呢就不说话了？ 还有一晚上过去了，自主醒来还是没有作用啊", weight: 0.54 },
+    { text: "用户: 全部清理完成，然后呢就不说话了？ 还有一晚上过去了，自主醒来还是没有作用啊", weight: 0.60 }, // 精确重复
+    { text: "当前记忆处于高唤醒状态 | 激活节点: 节点7(强:0.954), 节点360(强:0.949)", weight: 0.5 },
+    { text: "当前记忆处于高唤醒状态 | 激活节点: 节点1020(强:0.959), 节点817(强:0.951)", weight: 0.5 }, // 仅编号不同
+    { text: "完全不相干的另一条真记忆内容", weight: 0.4 },
+  ];
+  const out = dedupeNearDuplicateItems(items, 0.75, 24);
+  assert.equal(out.length, 3, `5 条应折叠为 3 条，实际 ${out.length}`);
+  const keptClean = out.find((x) => x.text.includes("全部清理完成"));
+  assert.ok(Math.abs(keptClean.weight - 0.60) < 1e-9, "重复指保留高分那条");
+  assert.ok(out.some((x) => x.text.includes("不相干")), "不相干条目必须保留（宁缺毋滥）");
+  assert.equal(dedupeNearDuplicateItems([], 0.75, 24).length, 0, "空输入安全");
+});
+
+ok("四刀开关：resolveInjectHygiene 默认全开 + pluginConfig/env 可关 + 无效值回退", () => {
+  const d = resolveInjectHygiene({}, {});
+  assert.equal(d.stripMachineNarration, true);
+  assert.equal(d.dedupeNearDuplicates, true);
+  assert.equal(d.entryTruncate, true);
+  assert.equal(d.recencyWeight, true);
+  assert.equal(d.entryMaxChars, 400);
+  // pluginConfig 优先
+  const c = resolveInjectHygiene({}, { stripMachineNarration: false, entryMaxChars: 250 });
+  assert.equal(c.stripMachineNarration, false);
+  assert.equal(c.entryMaxChars, 250);
+  // env 兵底
+  const e = resolveInjectHygiene({ INJECT_ENTRY_TRUNCATE: "0", INJECT_DEDUPE_SIMILARITY: "0.6" }, {});
+  assert.equal(e.entryTruncate, false);
+  assert.equal(e.dedupeSimilarity, 0.6);
+  // 无效值 → 默认（fail-open）
+  const bad = resolveInjectHygiene({ INJECT_ENTRY_MAX_CHARS: "abc", INJECT_RECENCY_FLOOR: "9" }, {});
+  assert.equal(bad.entryMaxChars, 400);
+  assert.equal(bad.recencyFloor, 0.25);
+});
+
+ok("四刀集成：buildContextText cut a（剔机器自述 + 自述指纹折叠 + 行动层不出）", () => {
+  const data = {
+    results: [
+      { origin: "lms", text: "用户: [回魂] 状态:熵1.00 惊讶22.08 … [记忆注入] 焦点记忆 5 条", scores: { total: 0.71 } },
+      { origin: "sandglass", text: "18点的时候🌙【梦中醒来】自主醒来 | 激活节点: 节点386(强:0.897)", scores: { total: 0.67 } },
+      { origin: "lms", text: "用户: 一晚上了，我们的自主醒来这一块还是没有任何反应", scores: { total: 0.66 } },
+    ],
+    self_ref: [
+      "当前记忆处于高唤醒状态 | 激活节点: 节点7(强:0.954)",
+      "当前记忆处于高唤醒状态 | 激活节点: 节点1020(强:0.959)",
+    ],
+  };
+  const off = buildContextText(data, "醒因", 4000, false, null, null, null, null, null);
+  assert.ok(off.includes("[记忆系统自述]"), "旧行为：self_ref 自述注入");
+  assert.ok(off.includes("[行动]"), "旧行为：行动层占位在");
+  assert.ok(off.includes("激活节点"));
+  const on = buildContextText(data, "醒因", 4000, false, null, null, null, null, resolveInjectHygiene({}, {}));
+  assert.ok(!on.includes("[记忆系统自述]"), "开刀后：机器自述不回注入");
+  assert.ok(!on.includes("[行动]"), "开刀后：行动层不注入");
+  assert.ok(!on.includes("激活节点"), "开刀后：激活节点清单不注入");
+  assert.ok(on.includes("自主醒来这一块还是没有任何反应"), "真记忆必须保留");
+  assert.ok(on.split("\n").filter((l) => /^\d+\. /.test(l)).length === 1, "应只剩 1 条真记忆");
+});
+
+ok("四刀集成：cut c 超长截断 + cut d 陈旧降权（新旧同分时新的胜出）", () => {
+  const now = Date.parse("2026-09-21T10:45:00+08:00");
+  const oldTs = Math.floor((now - 60 * 86400000) / 1000); // 60 天前
+  const newTs = Math.floor((now - 3600 * 1000) / 1000);   // 1 小时前
+  const longText = "陈旧长文开头" + "。".repeat(600) + "结论尾巴在此";
+  const data = {
+    results: [
+      { origin: "lms", text: longText, ts: oldTs, scores: { total: 0.70 } },
+      { origin: "lms", text: "新鲜条目", ts: newTs, scores: { total: 0.65 } },
+    ],
+  };
+  const off = buildContextText(data, "q", 8000, true, null, null, null, null, null);
+  assert.ok(off.includes(longText), "旧行为：超长条目不截断（全文注入）");
+  const on = buildContextText(data, "q", 8000, true, null, null, null, null, resolveInjectHygiene({}, {}));
+  // cut c 保头+尾：中间被省略、尾部结论保留
+  assert.ok(on.includes("结论尾巴在此"), "尾部结论应保留（保头+尾，非硬切）");
+  assert.ok(on.includes("…"), "应含截断标记");
+  const longLine = on.split("\n").find((l) => l.includes("陈旧长文开头"));
+  assert.ok(longLine.length < longText.length, "长条目行确实变短");
+  // cut d：老条目权（0.70×0.25=0.175）< 新条目权（0.65×~0.99）
+  const idxOld = on.indexOf("陈旧长文开头");
+  const idxNew = on.indexOf("新鲜条目");
+  assert.ok(idxNew < idxOld, "陈旧降权后新的排序在前（老条目降权非禁止）");
+});
+
+ok("fail-open：hygiene=null 退旧行为；四刀字段异常不抛错", () => {
+  const data = { results: [{ origin: "lms", text: "人类原话一条，不该被动", scores: { total: 0.5 } }] };
+  const legacy = buildContextText(data, "q", 800, true, null, null, null, null, null);
+  const hygieneNull = buildContextText(data, "q", 800, true, null, null, null, null, undefined);
+  assert.equal(legacy, hygieneNull, "hygiene 缺省 = 旧行为（零变化）");
+  // 异常字段（NaN/负数/超大）不得抛错
+  let ok2 = true;
+  try {
+    buildContextText(data, "q", 800, true, null, null, null, null,
+      { stripMachineNarration: true, dedupeNearDuplicates: true, entryTruncate: true, recencyWeight: true,
+        entryMaxChars: NaN, dedupeSimilarity: NaN, recencyFloor: -1, recencyHalfLifeDays: 0 });
+  } catch (e) { ok2 = false; }
+  assert.ok(ok2, "四刀字段异常不得抛错（fail-open）");
+});
+
+await okAsync("端到端：buildMemoryContext 默认开四刀 → 机器条目自注入中消失", async () => {
+  const { server, port } = await startMockGlue([
+    { id: "m1", text: "用户: [回魂] 状态:熵1.00 惊讶22.08 … [记忆注入] 焦点记忆 5 条", origin: "lms", system: "lms" },
+    { id: "m2", text: "用户: 真记忆：我们聊过自主醒来的设计", origin: "lms", system: "lms" },
+    { id: "m3", text: "18点的时候🌙【梦中醒来】自主醒来 | 激活节点: 节点386(强:0.897)", origin: "sandglass", system: "sandglass" },
+  ], { soul: null });
+  try {
+    _resetRateLimitForTest();
+    const text = await buildMemoryContext("真记忆 自主醒来 设计", {
+      glueUrl: `http://127.0.0.1:${port}`, minIntervalMs: 0, maxChars: 1500,
+    });
+    assert.ok(text && text.includes("真记忆"), "真记忆应注入");
+    assert.ok(!text.includes("激活节点"), "机器产物不应进注入");
+    assert.ok(!text.includes("[回魂]"), "机器注入留存不应进注入");
+  } finally {
+    server.close();
+  }
 });
 
 console.log("== 3. index.js 接线测试（SDK shim，临时 node_modules）==");

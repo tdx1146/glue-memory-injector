@@ -1159,7 +1159,7 @@ export function buildActionLayer(thought) {
  * @param {object|null} landscapeData 阶段 2 P1-1：/landscape/{sid} 响应（可选）。
  *   在场时景观叙事走读数派生（主导盆地/激活拓扑/σ 层级/漂移），缺失回退旧行为。
  */
-export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null, query = "", cfg = null, pickedThoughts = null, landscapeData = null) {
+export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null, query = "", cfg = null, pickedThoughts = null, landscapeData = null, hygiene = null) {
   // data 为 null = 未启用/请求失败（原因已在 postJson 记 MISS），此处不重复记
   if (!data || typeof data !== "object") return null;
   const parts = [];
@@ -1168,7 +1168,24 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null,
   const voices = Array.isArray(data.lms_voice)
     ? data.lms_voice.filter((v) => typeof v === "string" && v.trim())
     : [];
-  const uniqVoices = [...new Set(voices.map((v) => v.trim().replace(/\s+/g, " ")))].slice(0, 2);
+  // cut a+b（2026-09-21）：自述本是机器语音，其中"激活节点"清单类（现场 4 条
+  // 仅编号不同）应剔/折叠——与 buildContextText 的 self_ref 同法（词表同源）。
+  let voicesClean = voices;
+  if (hygiene && typeof hygiene === "object") {
+    try {
+      if (hygiene.stripMachineNarration) voicesClean = voicesClean.filter((v) => !isMachineNarration(v));
+      if (hygiene.dedupeNearDuplicates) {
+        const seen = new Set();
+        voicesClean = voicesClean.filter((v) => {
+          const fp = narrationFingerprint(v);
+          if (seen.has(fp)) return false;
+          seen.add(fp);
+          return true;
+        });
+      }
+    } catch { /* fail-open：退旧行为 */ }
+  }
+  const uniqVoices = [...new Set(voicesClean.map((v) => v.trim().replace(/\s+/g, " ")))].slice(0, 2);
   if (uniqVoices.length > 0) {
     parts.push(`自述:${uniqVoices.join("｜")}`);
   }
@@ -1185,7 +1202,12 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null,
   // ② 景观叙事（阶段 2 P1-1：真实读 /landscape 读数派生，≤200 字；
   //    /landscape 缺失 → 回退 react/soul 状态派生，fail-open）
   const landscape = buildLandscapeNarrative(reactData, data, landscapeData);
-  if (landscape) parts.push(landscape);
+  if (landscape) {
+    // cut a：剃掉景观叙事里的 [信息性标注：…] 机器标注段（读数保留）。
+    const cleaned = hygiene && typeof hygiene === "object" && hygiene.stripMachineNarration
+      ? scrubMachineSegments(landscape) : landscape;
+    if (cleaned) parts.push(cleaned);
+  }
 
   // ③ thought notes（阶段 2 思考链，2026-08-13；R7 灰度 2026-08-16）：
   //    按"与当前对话的激活度"取 1 条默认 + 余量灰度升 2（bigram 覆盖度；
@@ -1339,6 +1361,213 @@ export function trustDistributionStats(values) {
     p50: p(0.5),
     p90: p(0.9),
   };
+}
+
+// ── 注入瘦身四刀（2026-09-21，修复单：治注入端肥胖/陈旧/重复）──────────────
+// 现场（2026-09-21 10:44 一次真实醒来）：焦点记忆 7 条里 2-6 条同话题（"自主醒来
+// 没反应"）且全是 8 月历史长文（每条数百字全文）；[记忆系统自述] 含"激活节点"
+// 清单被重复 4 遍、[行动] 暂缓意向、[信息性标注…] 直接进注入。净效果 = 真记忆
+// 被稀释、上下文被烧、看着像原地打转。根因：召回 query = 醒因原文 → 每次都被
+// 召回"最像醒因那段话"的陈旧长文（只读定位见 memory-recall.js / extractQueryText
+// 与 buildContextText）。四刀 = 剔机器自述 / 同段去重 / 真记忆去冗 / 陈旧降权，
+// **各自可关、fail-open（任何一项抛错退旧行为，绝不阻断注入）**。
+// 边界（任务书纪律）：不改 LMS 检索语义、不动沙漏数据、不改唤醒出口——四刀全部
+// 是**注入端消费者侧**的重排/过滤，只改"拼进上下文的那段文本"，不回写任何库。
+//
+// 词表复用：与 lms-core/message_markers.py 的机器标记语义对齐（跨语言不 import，
+// 此处登记同一批字面量；新增标记先在该 py 与此处同步，防字面漂移）。
+const MACHINE_NARRATION_MARKERS = [
+  "[记忆系统自述]", "激活节点", "[信息性标注", "NO_REPLY",
+  "[回魂]", "[行动]", "[生成约束]", "[记忆注入]",
+  "🌙【梦中醒来】", "📬【信箱新消息】", "【信箱·新留言】",
+  "[wake-bridge]", "[lms-memory]", "[心跳]",
+  "[Subagent Context]", "[Inter-session message]", "[cron:",
+  "取代先前的快照", "你是思考链的【后台思考者】",
+];
+
+/** 机器自述判定（纯函数）：条目/自述文本是否机器产物（非人类原话）。
+ * 命中任一标记即判机器——用于焦点记忆条目、self_ref 自述、行动层文本。
+ * fail-open：非字符串/空 → true（空内容无注入价值，等同剔除）。
+ */
+export function isMachineNarration(text) {
+  if (typeof text !== "string") return true;
+  const t = text.trim();
+  if (!t) return true;
+  return MACHINE_NARRATION_MARKERS.some((m) => t.includes(m));
+}
+
+/** 段级机器标记清洗（纯函数）：移除行内的 [信息性标注：…] 段（熵饱和区诊断
+ * 标注，机器产物），并收拾残留的分隔符（避免 "｜｜" / 尾随 "｜"）。
+ * 用于【回魂】段里的景观叙事——只剃标注段，不碰读数本身。
+ */
+export function scrubMachineSegments(text) {
+  if (typeof text !== "string" || !text) return text;
+  return text
+    .replace(/\[信息性标注：[^\]]*\]/g, "")
+    .replace(/｜{2,}/g, "｜")
+    .replace(/｜\s*(?=\/|$)/g, "")
+    .replace(/\s*｜\s*$/, "")
+    .trim();
+}
+
+/** 结构指纹（纯函数）：剔数字 + 去空白。用于识别"同形状、仅编号不同"的
+ * 近重复（实测 self_ref 4 条仅"节点N"编号不同 → 应折叠为 1 条）。
+ */
+export function narrationFingerprint(text) {
+  return String(text || "").replace(/\d+/g, "#").replace(/\s+/g, "");
+}
+
+/** 解析注入端卫生参数（四刀开关 + 阈值）。
+ * 优先级：pluginConfig 字段 > env（INJECT_*）> 默认（全开）。
+ * 无效值回退默认（fail-open：解析异常绝不关掉所有刀）。
+ */
+export function resolveInjectHygiene(env, cfg) {
+  const e = env && typeof env === "object" ? env : {};
+  const c = cfg && typeof cfg === "object" ? cfg : {};
+  const bool = (v, dflt) => {
+    if (typeof v === "boolean") return v;
+    if (typeof v === "string") {
+      if (/^(0|false|no|off)$/i.test(v.trim())) return false;
+      if (/^(1|true|yes|on)$/i.test(v.trim())) return true;
+    }
+    return dflt;
+  };
+  const num = (v, dflt, lo, hi) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= lo && n <= hi ? n : dflt;
+  };
+  const pick = (key, envKey) => (c[key] !== undefined ? c[key] : e[envKey]);
+  return {
+    stripMachineNarration: bool(pick("stripMachineNarration", "INJECT_STRIP_MACHINE_NARRATION"), true),
+    dedupeNearDuplicates: bool(pick("dedupeNearDuplicates", "INJECT_DEDUPE_NEAR_DUPLICATES"), true),
+    dedupeSimilarity: num(pick("dedupeSimilarity", "INJECT_DEDUPE_SIMILARITY"), 0.75, 0.1, 1),
+    dedupeMinSharedChars: Math.round(num(pick("dedupeMinSharedChars", "INJECT_DEDUPE_MIN_SHARED_CHARS"), 24, 4, 400)),
+    entryTruncate: bool(pick("entryTruncate", "INJECT_ENTRY_TRUNCATE"), true),
+    entryMaxChars: Math.round(num(pick("entryMaxChars", "INJECT_ENTRY_MAX_CHARS"), 400, 40, 4000)),
+    entryTruncateTailChars: Math.round(num(pick("entryTruncateTailChars", "INJECT_ENTRY_TRUNCATE_TAIL_CHARS"), 60, 0, 400)),
+    recencyWeight: bool(pick("recencyWeight", "INJECT_RECENCY_WEIGHT"), true),
+    recencyHalfLifeDays: num(pick("recencyHalfLifeDays", "INJECT_RECENCY_HALF_LIFE_DAYS"), 14, 0.5, 3650),
+    recencyFloor: num(pick("recencyFloor", "INJECT_RECENCY_FLOOR"), 0.25, 0.01, 1),
+  };
+}
+
+/** 条目时间戳解析（纯函数）：glue /recall 每条带 ts——lms 条目 = entry.ts（unix
+ * 秒，数值）；沙漏条目 = "YYYY-MM-DD HH:MM:SS" 字符串（可能解析失败）。
+ * 数值/字符串都拿不到时回落条目文本里首个 YYYY-MM-DD；全无 → null（中性，
+ * 不降权——fail-open：宁可不过滤也不误杀）。
+ */
+export function parseEntryTimestamp(it) {
+  if (!it || typeof it !== "object") return null;
+  const ts = it.ts;
+  if (typeof ts === "number" && Number.isFinite(ts)) {
+    return ts > 1e12 ? ts : ts * 1000; // >1e12 视为毫秒，否则秒
+  }
+  if (typeof ts === "string") {
+    const m = ts.match(/(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+    if (m) {
+      const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+        Number(m[4] || 0), Number(m[5] || 0), Number(m[6] || 0));
+      const t = d.getTime();
+      if (Number.isFinite(t)) return t;
+    }
+  }
+  const txt = typeof it.text === "string" ? it.text : "";
+  const tm = txt.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (tm) {
+    const d = new Date(Number(tm[1]), Number(tm[2]) - 1, Number(tm[3]));
+    const t = d.getTime();
+    if (Number.isFinite(t)) return t;
+  }
+  return null;
+}
+
+/** 时效降权因子（纯函数，cut d）：f = halfLife / (halfLife + ageDays)，
+ * 夹到 [floor, 1]。老条目降权（非禁止），地板保证"旧"不等于"消失"。
+ * 无时间戳 → 1（中性，fail-open 不误杀）。
+ */
+export function recencyFactor(tsMs, nowMs, halfLifeDays, floor) {
+  if (!Number.isFinite(tsMs) || !Number.isFinite(nowMs)) return 1;
+  const hl = Number.isFinite(halfLifeDays) && halfLifeDays > 0 ? halfLifeDays : 14;
+  const fl = Number.isFinite(floor) && floor > 0 && floor <= 1 ? floor : 0.25;
+  const ageDays = Math.max(0, (nowMs - tsMs) / 86400000);
+  const f = hl / (hl + ageDays);
+  return Math.max(fl, Math.min(1, f));
+}
+
+/** 条目截断（纯函数，cut c）：超上限 → 头部 + "…" + 尾部（保留结论），
+ * 保证总长 ≤ maxChars。只作用于**注入文本**，不改原文存档（任务书红线）。
+ */
+export function truncateEntryText(text, maxChars, tailChars) {
+  const t = typeof text === "string" ? text : "";
+  const cap = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : 400;
+  if (t.length <= cap) return t;
+  const tail = Number.isFinite(tailChars) && tailChars > 0 ? Math.floor(tailChars) : 0;
+  if (tail <= 0 || cap <= 1) return `${t.slice(0, Math.max(0, cap - 1))}…`;
+  const headLen = Math.max(0, cap - tail - 1);
+  return `${t.slice(0, headLen)}…${t.slice(t.length - tail)}`;
+}
+
+/** 共享子串检测（纯函数）：a 中是否有长度 ≥ minChars 的子串出现在 b 中。
+ * 用于近重复判定（比 bigram Jaccard 更能抓住"一段长文本被整体复制"）。
+ */
+function hasSharedSubstring(a, b, minChars) {
+  const A = String(a || "");
+  const B = String(b || "");
+  const n = Math.max(2, Math.floor(minChars));
+  if (A.length < n || B.length < n) return false;
+  for (let i = 0; i + n <= A.length; i += 1) {
+    if (B.includes(A.slice(i, i + n))) return true;
+  }
+  return false;
+}
+
+/** 同段去重（纯函数，cut b）：一次注入内，"同一段/同一指纹"只留一份。
+ * 判据（任一命中即近重复，保留 weight 更高的那条）：
+ *   ① 数字归一化后结构指纹相同（self_ref 4 条仅节点编号不同 → 折叠 1 条）；
+ *   ② 数字归一化后 bigram Jaccard ≥ sim（改写式近重复）；
+ *   ③ 共享连续子串 ≥ minSharedChars（长文被整段复制）。
+ * 输入 items 假定已含 {text, weight}；返回新数组（不原地改）。fail-open：
+ * 空/异常 → 原样返回。
+ */
+export function dedupeNearDuplicateItems(items, sim = 0.75, minSharedChars = 24) {
+  if (!Array.isArray(items) || items.length <= 1) return items || [];
+  const ordered = [...items].sort((a, b) => (b.weight || 0) - (a.weight || 0));
+  const kept = [];
+  for (const it of ordered) {
+    const norm = narrationFingerprint(it.text);
+    const bi = bigramSet(norm);
+    let dup = false;
+    for (const k of kept) {
+      if (norm && norm === narrationFingerprint(k.text)) { dup = true; break; }
+      const kb = k._bigrams || bigramSet(narrationFingerprint(k.text));
+      let jac = 0;
+      if (bi.size > 0 && kb.size > 0) {
+        let hit = 0;
+        for (const g of bi) if (kb.has(g)) hit += 1;
+        const union = bi.size + kb.size - hit;
+        jac = union > 0 ? hit / union : 0;
+      }
+      if (jac >= sim) { dup = true; break; }
+      if (hasSharedSubstring(norm, narrationFingerprint(k.text), minSharedChars)) { dup = true; break; }
+    }
+    if (!dup) {
+      const copy = { ...it, _bigrams: bi };
+      kept.push(copy);
+    }
+  }
+  return kept.map(({ _bigrams, ...rest }) => rest);
+}
+
+// 注入卫生观测日志（与 logMiss 同模式；日志失败绝不影响主流程）。
+function logHygiene(stats) {
+  try {
+    appendFileSync(
+      DEBUG_LOG_FILE,
+      `[${new Date().toISOString()}] HYGIENE machine=${stats.machine} dup=${stats.dup}`
+        + ` trunc=${stats.trunc} recency=${stats.recency} kept=${stats.kept}`
+        + ` chars=${stats.chars}\n`,
+    );
+  } catch { /* 日志失败忽略：不引入新崩溃点 */ }
 }
 
 // P1-2 观测日志（与 logMiss 同模式；日志失败绝不影响主流程）
@@ -2017,8 +2246,11 @@ export async function runVerifyChain(cfg, userQuery, results) {
  *   map（normalizeEntryKey(候选) → {verdict, reason, highTrust}，runVerifyChain
  *   返回）。conflict-确认 条目在注入面标注 [doubt] conflict（可见怀疑，与 P1-2
  *   [doubt] lowconf 正交——冲突标注是验证结果，非低信任惩罚）。缺省 null。
+ * @param {object|null} hygiene 注入卫生四刀（2026-09-21；resolveInjectHygiene 产物）。
+ *   缺省 null = 关闭四刀（退旧行为——直接单测/向后兼容路径零变化）。fail-open：
+ *   四刀任何一步异常都被 try/catch 兜住，退旧行为继续拼注入，绝不抛。
  */
-export function buildContextText(data, query, maxChars, skipSelfRef = false, reactData = null, activatedThought = null, consistencyByText = null, verifyByText = null) {
+export function buildContextText(data, query, maxChars, skipSelfRef = false, reactData = null, activatedThought = null, consistencyByText = null, verifyByText = null, hygiene = null) {
   if (!data || typeof data !== "object") {
     logMiss("recall-invalid-response"); // P0-1：/recall 响应结构异常
     return null;
@@ -2082,6 +2314,9 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
     }
     items.push({
       text,
+      // key 在截断前算好（cut c 会截 text，但 consistency/verify join 依赖完整键）
+      key: normalizeEntryKey(text),
+      tsMs: parseEntryTimestamp(it),
       origin: typeof it?.origin === "string" && it.origin ? it.origin : "",
       score: typeof it?.scores?.total === "number" ? it.scores.total : null,
       weight: policy.score,
@@ -2096,7 +2331,48 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
   // /标注可见（审计 D 同法：高相关低信任沉底）
   // 自指回路止血（2026-09-16，四妹定位）: weight<=0 = 打分器已判无价值（如 [回魂]/self_ref
   // 被压到 0 权），但它仍按"条数"占位 ⇒ 先剔，再按条数截断（判决与执行对齐）。
-  const usable = items.filter((it) => Number(it.weight) > 0);
+  let usable = items.filter((it) => Number(it.weight) > 0);
+  // ── 注入瘦身四刀（2026-09-21，hygiene 缺省 null = 关闭，退旧行为）──
+  // 顺序：a 剔机器自述 → c 真记忆去冗 → b 同段去重 → d 陈旧降权。
+  //   - a 先剔掉机器产物（它们常是"包含其他条目文本"的注入留存，先剔防污染
+  //     b 的去重判据）；
+  //   - c 在去重前截断，让去重判据工作在"实际要注入的文本"上（长文截尾后
+  //     更易暴露同源重复）；
+  //   - d 最后生效于 weight（排序 + 显示权值都能看到时代价）。
+  //   fail-open：整段 try/catch，任何异常 → hygiene 视同 null（不改 usable）。
+  if (hygiene && typeof hygiene === "object") {
+    try {
+      const st = { machine: 0, dup: 0, trunc: 0, recency: 0, kept: 0, chars: 0 };
+      if (hygiene.stripMachineNarration) {
+        const before = usable.length;
+        usable = usable.filter((it) => !isMachineNarration(it.text));
+        st.machine = before - usable.length;
+      }
+      if (hygiene.entryTruncate) {
+        for (const it of usable) {
+          const t = truncateEntryText(it.text, hygiene.entryMaxChars, hygiene.entryTruncateTailChars);
+          if (t !== it.text) { it.text = t; st.trunc += 1; }
+        }
+      }
+      if (hygiene.dedupeNearDuplicates && usable.length > 1) {
+        const before = usable.length;
+        usable = dedupeNearDuplicateItems(usable, hygiene.dedupeSimilarity, hygiene.dedupeMinSharedChars);
+        st.dup = before - usable.length;
+      }
+      if (hygiene.recencyWeight) {
+        const now = Date.now();
+        for (const it of usable) {
+          const f = recencyFactor(it.tsMs, now, hygiene.recencyHalfLifeDays, hygiene.recencyFloor);
+          if (f < 1) { it.weight = it.weight * f; st.recency += 1; }
+        }
+      }
+      st.kept = usable.length;
+      st.chars = usable.reduce((s, it) => s + it.text.length, 0);
+      logHygiene(st);
+    } catch {
+      // 四刀任一步异常 → 退旧行为（usable 保持异常前状态；不抛、不阻断注入）
+    }
+  }
   usable.sort((a, b) => b.weight - a.weight);
   const picked = usable.slice(0, FOCUS_MAX_ITEMS);
   if (picked.length === 0) {
@@ -2118,7 +2394,7 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
     // 与 [doubt] lowconf 正交：冲突标注是验证结果，非低信任惩罚（R1 二选一
     // 是 P1-2 的 trust 语义，本标注是 P1-3 的验证语义，互不替代）。
     const vEntry = verifyByText && typeof verifyByText === "object"
-      ? verifyByText[normalizeEntryKey(it.text)] : null;
+      ? verifyByText[it.key || normalizeEntryKey(it.text)] : null;
     const conflictTag = vEntry && vEntry.verdict === "confirmed"
       ? " [doubt] conflict" : "";
     lines.push(`${i + 1}. ${meta} ${it.text}${it.lowTrustAnnotated ? " [doubt] lowconf" : ""}${conflictTag}`);
@@ -2127,8 +2403,12 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
   // ⑤ 质疑层 + ⑥ 行动层（阶段 4：激活的 thought 才带行动意向；无则占位）
   const doubt = buildDoubtLayer(results, reactData);
   if (doubt) lines.push(doubt);
-  const actionLine = buildActionLayer(activatedThought);
-  lines.push(actionLine || "[行动] 无（暂无行动意向）");
+  // ⑥ 行动层（cut a）：行动层是思考链自产的"机器自述"（该做/想/愿），现场取证
+  // 它直接进注入稀释真记忆 → 开 hygiene 时不注入（含占位行）。
+  if (!(hygiene && typeof hygiene === "object" && hygiene.stripMachineNarration)) {
+    const actionLine = buildActionLayer(activatedThought);
+    lines.push(actionLine || "[行动] 无（暂无行动意向）");
+  }
 
   // ── L1 生成约束（状态调制生成 · 第一跳）──
   // 信号源 = reactData.reaction.doubt（与质疑层同源，零新 HTTP，修订 2/6）；
@@ -2146,7 +2426,23 @@ export function buildContextText(data, query, maxChars, skipSelfRef = false, rea
   // 反思回流：附加记忆系统最近自述（LMS self_ref 产物）；
   // 回魂段已含自述时跳过，避免重复占用上下文预算。
   if (!skipSelfRef) {
-    const voices = Array.isArray(data.self_ref) ? data.self_ref.filter(v => typeof v === "string" && v.trim()) : [];
+    let voices = Array.isArray(data.self_ref) ? data.self_ref.filter(v => typeof v === "string" && v.trim()) : [];
+    // cut a+b：剔机器自述（"激活节点"清单等）+ 同指纹折叠（实测 4 条仅节点编号
+    // 不同 → 折叠为 1 条，治"[记忆系统自述] 被重复 4 遍"）。
+    if (hygiene && typeof hygiene === "object") {
+      try {
+        if (hygiene.stripMachineNarration) voices = voices.filter((v) => !isMachineNarration(v));
+        if (hygiene.dedupeNearDuplicates) {
+          const seen = new Set();
+          voices = voices.filter((v) => {
+            const fp = narrationFingerprint(v);
+            if (seen.has(fp)) return false;
+            seen.add(fp);
+            return true;
+          });
+        }
+      } catch { /* fail-open：退旧行为 */ }
+    }
     if (voices.length > 0) {
       lines.push(`[记忆系统自述] ${voices.join(" / ")}`);
     }
@@ -2237,6 +2533,8 @@ export function composeContext(soulText, memoryText, maxChars) {
  */
 export async function buildMemoryContext(prompt, pluginConfig) {
   const cfg = resolveConfig(pluginConfig);
+  // 注入瘦身四刀（2026-09-21）：从 pluginConfig/env 解析，默认全开。
+  const hygiene = resolveInjectHygiene(process.env, pluginConfig);
   if (!cfg.enabled) {
     logMiss("plugin-disabled"); // P0-1
     return null;
@@ -2297,7 +2595,7 @@ export async function buildMemoryContext(prompt, pluginConfig) {
     // 【回魂】段（≤soulMaxChars），优先于记忆块；解读段经 reactData 追加；
     // 阶段 2：query + cfg 透传（③ thought notes 激活度筛选需要）；
     // P1-1：landscapeData 透传（② 景观叙事真实读 /landscape 读数派生）。
-    const soulText = buildSoulText(soulData, cfg.soulMaxChars, reactData, query, cfg, picked, landscapeData);
+    const soulText = buildSoulText(soulData, cfg.soulMaxChars, reactData, query, cfg, picked, landscapeData, hygiene);
     // P1-4（审计 2026-08-14）：注入预算余量保护。旧实现按 maxChars 顶格执行
     // （实测 798/800，余量 2 字——回魂段 301 必截、最近记忆必丢）。现在：
     //   ① 总量按 maxChars-COMPOSE_MARGIN=760 执行（40 字安全余量）；
@@ -2335,7 +2633,7 @@ export async function buildMemoryContext(prompt, pluginConfig) {
     // reactData 透传给 buildContextText：质疑层需要全局 precision 信号；
     // consistencyByText：P1-2 consistency 窄路径数据（缺省 null → 静态默认）；
     // verifyByText：P1-3 验证链产物（缺省 null → 无冲突标注）
-    const memoryText = buildContextText(recallData, query, memoryBudget, Boolean(soulText), reactData, pickedThought, consistencyByText, verifyByText);
+    const memoryText = buildContextText(recallData, query, memoryBudget, Boolean(soulText), reactData, pickedThought, consistencyByText, verifyByText, hygiene);
 
     return composeContext(soulText, memoryText, injectBudget);
   } catch (err) {
