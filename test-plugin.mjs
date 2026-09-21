@@ -1628,6 +1628,7 @@ const {
   buildStorePayload,
   storeTurnFromGlue,
   handleAgentEnd,
+  isMachineTerminator,
   _resetFingerprintForTest,
   _getFingerprintStateForTest,
 } = await import("./store-turn.js");
@@ -1844,6 +1845,56 @@ await okAsync("handleAgentEnd：四闸跳过（心跳/子代理/cron/失败轮�
     await handleAgentEnd({ messages: MSGS_NORMAL, success: true }, { runId: "c", sessionId: "main", jobId: "job-1", trigger: "cron" }, api, env);
     await handleAgentEnd({ messages: MSGS_NORMAL, success: false, error: "aborted" }, { runId: "f", sessionId: "main" }, api, env);
     assert.equal(state.requests.length, 0, "四闸轮必须零请求");
+  } finally { server.close(); }
+});
+
+// ── 机器终止符闸（2026-09-21 修复单）──────────────────────────────────
+
+await okAsync("isMachineTerminator：整串哨兵才算（含空白/换行）", () => {
+  assert.equal(isMachineTerminator("NO_REPLY"), true);
+  assert.equal(isMachineTerminator(" no_reply \n"), true);
+  assert.equal(isMachineTerminator("\u200bNO_REPLY"), true);
+  assert.equal(isMachineTerminator("你说 NO_REPLY 的根因"), false, "含→不判（防误伤）");
+  assert.equal(isMachineTerminator("NO_REPLY 的根因"), false);
+  assert.equal(isMachineTerminator(""), false);
+  assert.equal(isMachineTerminator(null), false);
+});
+
+await okAsync("resolveStoreConfig：dropMachineTerminators = config 优先 + env 兜底（缺省开）", () => {
+  assert.equal(resolveStoreConfig({}, {}).dropMachineTerminators, true, "全未设 = 开");
+  assert.equal(resolveStoreConfig({ storeTurn: { dropMachineTerminators: false } }, { GLUE_STORE_DROP_TERMINATORS: "1" }).dropMachineTerminators, false, "config=false 显式关");
+  assert.equal(resolveStoreConfig({}, { GLUE_STORE_DROP_TERMINATORS: "0" }).dropMachineTerminators, false, "env='0' 关");
+  assert.equal(resolveStoreConfig({}, { GLUE_STORE_DROP_TERMINATORS: "false" }).dropMachineTerminators, false, "env='false' 关");
+});
+
+const MSGS_NO_REPLY = [
+  { role: "user", content: "你想了个屁" },
+  { role: "assistant", content: "NO_REPLY" },
+];
+
+await okAsync("handleAgentEnd：助手回合=NO_REPLY → 零请求（STORE-SKIP terminator）", async () => {
+  _resetFingerprintForTest();
+  const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
+  try {
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    const env = {};
+    await handleAgentEnd({ messages: MSGS_NO_REPLY, success: true }, { runId: "t1", sessionId: "main" }, api, env);
+    assert.equal(state.requests.length, 0, "哨兵回合不得回写（堵源）");
+  } finally { server.close(); }
+});
+
+await okAsync("handleAgentEnd：提取到含 NO_REPLY 的真句子 → 照写（误伤保护）", async () => {
+  _resetFingerprintForTest();
+  const { server, port, state } = await startMockStoreTurn({ resp: { stored: true } });
+  try {
+    const api = { pluginConfig: { glueUrl: `http://127.0.0.1:${port}`, storeTurn: { enabled: true, minIntervalMs: 0 } } };
+    const env = {};
+    const msgs = [
+      { role: "user", content: "继续" },
+      { role: "assistant", content: "那条 NO_REPLY 的根因我认，这里是实际动作" },
+    ];
+    await handleAgentEnd({ messages: msgs, success: true }, { runId: "t2", sessionId: "main" }, api, env);
+    assert.equal(state.requests.length, 1, "非终止符回合照常写");
   } finally { server.close(); }
 });
 
