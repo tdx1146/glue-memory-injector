@@ -61,6 +61,26 @@ const SENDER = "openclaw-agent_end";
 // 与 session_store.py 的 SOURCE_KIND_USER 同值（glue/lms-api/archive 全线已支持）。
 const MARK_USER = "user";
 const MARK_AGENT = "agent";
+
+// 机器终止符（2026-09-21 修复单，dandan 亲令“堵源”）：助手回合正文 =
+// NO_REPLY 类哨兵 ⇒ 本轮**无实质发言**，不发 /store（否则经 glue → LMS archive
+// 落一行 self_ref NO_REPLY + 经落沙进 sandglass.txt → 回魂 `最近:` 直接注入）。
+// 词表镜像 lms-core/message_markers.py 的 MACHINE_TERMINATORS（跨语言不 import，
+// 新增令牌先改 py 再同步此处，防字面漂移）。判据 = 归一化后**整串相等**（不做
+// 包含匹配），与 py 侧一致。
+const MACHINE_TERMINATORS = ["NO_REPLY"];
+const TERMINATOR_STRIP_RE = /[\s\u200b\ufeff\u200e\u200f]/g;
+// 开关 env fallback（config.storeTurn.dropMachineTerminators 优先；本 env 仅
+// "0"/"false" 关，缺省开——与 sourceKindEnabled 同一「config 优先 + env 兜底」）。
+const STORE_DROP_TERM_ENV = "GLUE_STORE_DROP_TERMINATORS";
+
+/** 机器终止符判定（纯函数）：归一化后整串 == 词表项 → true。fail-open（非串/空→false）。 */
+export function isMachineTerminator(text) {
+  if (typeof text !== "string") return false;
+  const t = text.replace(TERMINATOR_STRIP_RE, "").trim();
+  if (!t) return false;
+  return MACHINE_TERMINATORS.some((m) => t.toUpperCase() === m.toUpperCase());
+}
 // 开关 env fallback（config.storeTurn.sourceKindEnabled 优先；未设时读本 env，
 // 仅 "0"/"false" 关，缺省开——与 GLUE_STORE_TURN_ENABLED 同一「config 优先 + env 兜底」模式）。
 const STORE_SOURCE_KIND_ENV = "GLUE_STORE_SOURCE_KIND_ENABLED";
@@ -197,6 +217,14 @@ export function resolveStoreConfig(pluginConfig, env = process.env) {
           : !["0", "false"].includes(env && env[STORE_SOURCE_KIND_ENV]),
     glueUrl:
       typeof pc.glueUrl === "string" && pc.glueUrl ? pc.glueUrl : GLUE_DEFAULT_URL,
+    // 机器终止符过滤开关（2026-09-21）：config 显式值优先，未设时 env 兜底
+    // （仅 "0"/"false" 关）。缺省开 = 哨兵不回写（与 py 侧 store.drop_machine_terminators 同义）。
+    dropMachineTerminators:
+      st.dropMachineTerminators === true
+        ? true
+        : st.dropMachineTerminators === false
+          ? false
+          : !["0", "false"].includes(env && env[STORE_DROP_TERM_ENV]),
   };
 }
 
@@ -464,6 +492,14 @@ export async function handleAgentEnd(event, ctx, api, env = process.env) {
     if (turn.modeB) {
       logStore("STORE-SKIP", `reason=intersession run=${runId}`);
       updateStoreState({ skipReason: "intersession" });
+      return;
+    }
+
+    // 机器终止符闸（2026-09-21）：助手回合正文 = NO_REPLY 类哨兵 ⇒ 本轮无实质
+    // 发言，不回写（STORE-SKIP reason=terminator）。开关可关（cfg.dropMachineTerminators）。
+    if (cfg.dropMachineTerminators && isMachineTerminator(turn.assistantText)) {
+      logStore("STORE-SKIP", `reason=terminator run=${runId}`);
+      updateStoreState({ skipReason: "terminator" });
       return;
     }
 
