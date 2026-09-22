@@ -1638,7 +1638,8 @@ export function trustDistributionStats(values) {
 //
 // 词表复用：与 lms-core/message_markers.py 的机器标记语义对齐（跨语言不 import，
 // 此处登记同一批字面量；新增标记先在该 py 与此处同步，防字面漂移）。
-const MACHINE_NARRATION_MARKERS = [
+// export：供测试/回放核对「新增词表是否引入新误伤」（单源一致性）
+export const MACHINE_NARRATION_MARKERS = [
   "[记忆系统自述]", "激活节点", "[信息性标注", "NO_REPLY",
   "[回魂]", "[行动]", "[生成约束]", "[记忆注入]",
   "🌙【梦中醒来】", "📬【信箱新消息】", "【信箱·新留言】",
@@ -1661,7 +1662,7 @@ const MACHINE_NARRATION_MARKERS = [
 // “原样回写的机制是什么”，那样会误剔真原话。
 // 单一来源：与 lms-core/message_markers.py 的 `MACHINE_RECEIPT_RES` 同批字面量
 // （跨语言不 import；新增先改 py 再镜像此处，防字面漂移）。
-const MACHINE_RECEIPT_RES = [
+export const MACHINE_RECEIPT_RES = [
   /(?:已写入|已写|已产出|已完成)[^｜\n]{0,48}\/tmp\/think_(?:output|input)\.json/,
   /think_(?:output|input)\.json[^｜\n]{0,40}原样回写/,
   /(?:session_id|session id)[^｜\n]{0,40}原样回写/,

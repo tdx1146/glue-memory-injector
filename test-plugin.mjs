@@ -64,6 +64,7 @@ const {
   stripMachineNoiseFromSoul,
   buildSoulOnlyWakeText,
   readSoulState,
+  MACHINE_RECEIPT_RES,
 } = await import("./memory-recall.js");
 
 let passed = 0;
@@ -1429,12 +1430,16 @@ await okAsync("真实 /soul 返回完整回魂快照", async () => {
   assert.equal(snap.ok, true, "ok=true");
   assert.ok(Array.isArray(snap.lms_voice), "lms_voice 为数组");
   assert.ok(snap.lms_state && typeof snap.lms_state === "object", "lms_state 为对象");
-  assert.ok(
-    typeof snap.lms_state.entropy_ratio === "number" &&
-      typeof snap.lms_state.last_surprise === "number" &&
-      typeof snap.lms_state.purpose_coherence === "number",
-    "状态指标含 熵/惊讶/目的",
-  );
+  // 2026-09-22 收尾：/soul 的 lms_state 是 **v2 形状**（entropy/surprise/turn +
+  // lifecycle.state_update.purpose_coherence），旧 v1 字段名（entropy_ratio/
+  // last_surprise/purpose_coherence）在生产里**不存在**——消费侧走 readSoulState
+  // 适配（见 2.12）。此处锁 v2 形状契约。
+  assert.equal(typeof snap.lms_state.entropy, "number", "含 v2 entropy");
+  assert.equal(typeof snap.lms_state.surprise, "number", "含 v2 surprise");
+  assert.equal(typeof snap.lms_state.turn, "number", "含 v2 turn");
+  const sv = readSoulState(snap.lms_state);
+  assert.ok(sv.entropyRatio !== null && sv.surprise !== null && sv.coherence !== null && sv.turnCount !== null,
+    "readSoulState 应能解出 熵/惊讶/目的/轮次");
   // recent 非空是环境态（沙漏侧条目可能全为巡检/心跳噪音，被 _filter_soul_noise
   // 过滤后为空——LMS 重启/记忆轮换后实测为空）→ 只锁结构契约（数组 + 条目字段），
   // 不锁内容非空（防环境 flake；本测试核心 = 真实 /soul 端点结构 + 回魂段组装）
@@ -1444,7 +1449,7 @@ await okAsync("真实 /soul 返回完整回魂快照", async () => {
   const soulText = buildSoulText(snap, 300);
   assert.ok(typeof soulText === "string" && soulText.startsWith("[回魂]"), "真实快照可组装为回魂段");
   assert.ok(soulText.length <= 300, `回魂段应 ≤300 字，实际 ${soulText.length}`);
-  console.log(`     (voice ${snap.lms_voice.length} 条, 熵${snap.lms_state.entropy_ratio.toFixed(2)}, recent ${snap.recent.length} 条, 回魂段 ${soulText.length} 字)`);
+  console.log(`     (voice ${snap.lms_voice.length} 条, 熵${sv.entropyRatio.toFixed(2)}, recent ${snap.recent.length} 条, 回魂段 ${soulText.length} 字)`);
 });
 
 async function recallFromGlueForTest() {
@@ -2367,6 +2372,118 @@ await okAsync("刀f：剥净不崩——/soul 故障 → null；soulEnabled:fals
     assert.equal(nosoul, null, "soulEnabled:false → 不注");
     assert.equal(seen.length, s0, "soulEnabled:false → 不请求");
   } finally { server.close(); }
+});
+
+console.log("== 2.12 回魂收尾两处（2026-09-22，dandan 亲批）==");
+
+// 真实 /soul 响应字段（2026-09-22 15:50 只读实测抓取的形状，非虚构）
+const V2_SOUL_STATE = {
+  session_id: "main", turn: 3214, j_target: 11.0, j_norm: 11.000007,
+  surprise: 58.150677, entropy: 7.336494,
+  capacity: { entries: 7013, num_nodes: 1536, input_dim: 1024 },
+  lifecycle: { emit: { turn_count: 3214 },
+    state_update: { purpose_coherence: 0.989842, purpose_precision_mean: 0.143005 } },
+};
+
+ok("收尾A：readSoulState 映射 v2 /soul 形状（逐字段）+ v1 向后兼容 + 缺字段 fail-open", () => {
+  const sv = readSoulState(V2_SOUL_STATE);
+  // 熵比 = entropy / ln(num_nodes)（与内核 loop.py:1813 同式）
+  assert.ok(Math.abs(sv.entropyRatio - 7.336494 / Math.log(1536)) < 1e-9, `熵比映射，实际 ${sv.entropyRatio}`);
+  assert.equal(sv.surprise, 58.150677, "惊讶 ← v2 surprise");
+  assert.equal(sv.coherence, 0.989842, "目的 ← lifecycle.state_update.purpose_coherence");
+  assert.equal(sv.turnCount, 3214, "轮次 ← v2 turn");
+  // 向后兼容：v1 字段名在场时优先（老 mock/老接入零回归）
+  const v1 = readSoulState({ entropy_ratio: 0.95, last_surprise: 0.11, purpose_coherence: 0.92, turn_count: 7,
+    entropy: 6.9, surprise: 99, turn: 999, capacity: { num_nodes: 1536 } });
+  assert.equal(v1.entropyRatio, 0.95); assert.equal(v1.surprise, 0.11);
+  assert.equal(v1.coherence, 0.92); assert.equal(v1.turnCount, 7);
+  // 缺字段 → null（不编数字）；非对象 fail-open
+  assert.deepEqual(readSoulState({}), { entropyRatio: null, surprise: null, coherence: null, turnCount: null });
+  assert.deepEqual(readSoulState(null), { entropyRatio: null, surprise: null, coherence: null, turnCount: null });
+  assert.deepEqual(readSoulState({ entropy: 7.3, capacity: { num_nodes: 1 } }),
+    { entropyRatio: null, surprise: null, coherence: null, turnCount: null }, "num_nodes≤1 不折算");
+});
+
+ok("收尾A：buildSoulText 用 v2 形状渲染状态段（数值与 API 一致）", () => {
+  const out = buildSoulText({ lms_voice: [], lms_state: V2_SOUL_STATE, recent: [] }, 400);
+  assert.ok(out && out.startsWith("[回魂]"), `应能组装：${out}`);
+  // 熵比 7.336494/ln(1536)=0.99993 → 1.00；惊讶 58.15；目的 0.99；轮次 3214
+  assert.ok(out.includes("状态:熵1.00 惊讶58.15 目的0.99 轮次3214"), `状态段缺失/数值不符：${out}`);
+  // 反证：只读 v1 名的老逻辑对 v2 形状会渲出空状态段（本单修的正是这个）
+  const oldBits = ["entropy_ratio", "last_surprise", "purpose_coherence", "turn_count"]
+    .filter((k) => typeof V2_SOUL_STATE[k] === "number");
+  assert.equal(oldBits.length, 0, "v2 响应里不含任何 v1 字段名（这就是恒缺的根因）");
+});
+
+await okAsync("收尾A 集成：真实 /soul + /landscape → 回魂含状态段且数值与 API 一致", async () => {
+  const resp = await fetch("http://127.0.0.1:19000/soul", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: "main", recent_n: 3 }),
+  });
+  assert.equal(resp.status, 200, "glue /soul HTTP 200");
+  const snap = await resp.json();
+  const sv = readSoulState(snap.lms_state);
+  // 与真实 API 字段逐一对齐（entropy/ln(num_nodes) / surprise / purpose_coherence / turn）
+  assert.ok(Math.abs(sv.entropyRatio - snap.lms_state.entropy / Math.log(snap.lms_state.capacity.num_nodes)) < 1e-9, "熵比与 API 一致");
+  assert.equal(sv.surprise, snap.lms_state.surprise, "惊讶与 API 一致");
+  assert.equal(sv.turnCount, snap.lms_state.turn, "轮次与 API 一致");
+  const out = buildSoulText(snap, 300);
+  assert.ok(typeof out === "string" && out.includes("状态:"), `真实快照应渲出状态段：${out}`);
+  assert.ok(out.includes(`轮次${sv.turnCount}`), "状态段轮次 = API turn");
+  console.log(`     (真实 API: 熵${snap.lms_state.entropy} 惊讶${snap.lms_state.surprise} 目的${sv.coherence} 轮次${snap.lms_state.turn} → 状态段在场)`);
+});
+
+ok("收尾B：isMachineNarration 识别机器写库/工具回执（形状锚定，不误伤人话）", () => {
+  const machine = [
+    "已写入 /tmp/think_output.json（session_id 原样回写 think-20260922072004-a1）。R179 topic「读数顶格」：…",
+    "已产出并写入 `/tmp/think_output.json`（session_id `think-20260922152003-a1` 原样回写）。",
+    "已写 `/tmp/think_output.json`（session_id `think-20260922040148-a1` 原样回写）。",
+    "thought 已写入 /tmp/think_output.json（session_id 原样回写）。",
+    "已完成：`/tmp/think_output.json` 已写入（session_id 原样回写 think-20260819055002-a1）。",
+    "后台思考完成，产出已写入 /tmp/think_output.json（session_id 原样回写 think-20260821201002-a1）。",
+    "- **session_id**: think-20260820174002-a1（原样回写）",
+  ];
+  for (const t of machine) assert.equal(isMachineNarration(t), true, `机器回执必须命中：${t.slice(0, 40)}`);
+  const human = [
+    "我已经写入了，你看看对不对",
+    "帮我把内容写入 /tmp/report.json",
+    "think_output.json 这个文件在哪？",
+    "原样回写的机制是什么？",
+    "已写入的字段少了三个",
+    "/tmp/think_input.json 是调度器给后台思考者的原料",
+  ];
+  for (const t of human) assert.equal(isMachineNarration(t), false, `人话不得误伤：${t}`);
+});
+
+ok("收尾B 集成：最近: 段机器回执不进注入，人话最近保留", () => {
+  const data = {
+    lms_voice: [],
+    lms_state: V2_SOUL_STATE,
+    recent: [
+      { text: "已写入 /tmp/think_output.json（session_id 原样回写 think-20260922072004-a1）。R179 topic…" },
+      { text: "最近一条人话记忆：网关重载去做吧" },
+    ],
+  };
+  const out = buildSoulText(data, 600, null, "", null, [], null, resolveInjectHygiene({}, {}));
+  assert.ok(out.includes("最近:最近一条人话记忆"), `人话最近应保留：${out}`);
+  assert.ok(!out.includes("think_output.json") && !out.includes("原样回写") && !out.includes("已写入"),
+    `机器回执不得进注入：${out}`);
+});
+
+ok("收尾B：词表单一来源——JS MACHINE_RECEIPT_RES 与 message_markers.py 同批字面量", () => {
+  assert.equal(MACHINE_RECEIPT_RES.length, 3, "三条形状锚定规则");
+  for (const r of MACHINE_RECEIPT_RES) assert.ok(r instanceof RegExp, "应为 RegExp");
+  const pyPath = "/vol2/1000/AI专用/agentos-v2/lms-core/message_markers.py";
+  let py = null;
+  try { py = readFileSync(pyPath, "utf8"); } catch { /* 无仓库副本（异机）→ 只校验 JS 侧 */ }
+  if (py) {
+    const block = py.split("MACHINE_RECEIPT_RES: tuple = (")[1]
+      ?.split(")\n")[0] || "";
+    assert.ok(block.includes("原名") || block.length > 0, "应能定位 py 词表块");
+    // 归一化 JS 正则 source（\/ → /）后应与 py 字面量一致
+    const jsNorm = MACHINE_RECEIPT_RES.map((r) => r.source.replace(/\\\//g, "/"));
+    for (const p of jsNorm) assert.ok(block.includes(p), `py 应含同批字面量：${p}`);
+  }
 });
 
 console.log("== 3. index.js 接线测试（SDK shim，临时 node_modules）==");
