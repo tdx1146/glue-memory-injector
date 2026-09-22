@@ -1299,6 +1299,58 @@ export function buildActionLayer(thought) {
 }
 
 /**
+ * 回魂「状态」读数解析（2026-09-22 收尾单）：把 v2 `/soul` 的 `lms_state`
+ * 形状映射为状态段四个读数（熵/惊讶/目的/轮次）。
+ *
+ * **为什么必须映射**（老问题，非第六刀引入）：glue `/soul` 返回的 `lms_state`
+ * 是 **v2 形状**——glue/server.py:1388 `snap["lms_state"] = ensure_lms().status(sid)`
+ * → lms-api/server.py:860 `_status_body()`：
+ *   `{turn, entropy, surprise, j_norm, capacity:{num_nodes}, lifecycle:{…}}`
+ * 而本文件此前按 **v1 字段名** {entropy_ratio, last_surprise, purpose_coherence,
+ * turn_count} 读——这四个键在 v2 响应里**一个都不存在** ⇒ 状态段恒不渲染
+ * （生产注入历来只有自述/景观/最近，从来没有状态读数）。
+ *
+ * **逐字段映射**（每个源都标注内核里定义它的位置——只读定位，不是猜字段名）：
+ *   熵比 entropy_ratio      ← `entropy / ln(capacity.num_nodes)`
+ *        （v1 同式：lms-core/loop.py:1813-1814 `max_entropy = math.log(num_nodes)`；
+ *          与 /landscape 的 `activation.entropy_norm` 同式同源，lms-api/server.py:118-119。
+ *          v2 status 给的是**原始熵** `entropy`（nats），故按同式折算成比值。）
+ *   惊讶 last_surprise      ← `surprise`（lms-api/server.py:889，最近一轮 encode 的惊讶）
+ *   目的 purpose_coherence  ← `lifecycle.state_update.purpose_coherence`
+ *        （lms-core/loop.py:2414 写入；实测 /soul 响应 = 0.989842）
+ *   轮次 turn_count         ← `turn`（lms-api/server.py:864 `"turn": loop.turn_count`）
+ *
+ * **向后兼容**：v1 字段名在场时**优先**（老 mock / 老接入零回归）。
+ * 纯函数、零副作用；任一字段缺失 → 该读数为 null（不编数字）。
+ *
+ * @param {object} st `data.lms_state`
+ * @returns {{entropyRatio:number|null, surprise:number|null, coherence:number|null, turnCount:number|null}}
+ */
+export function readSoulState(st) {
+  const s = st && typeof st === "object" ? st : {};
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  // 熵比：v1 直给；否则用 v2 原始熵 + 节点数按内核同式（ln(num_nodes)）折算。
+  let entropyRatio = num(s.entropy_ratio);
+  if (entropyRatio === null) {
+    const entropy = num(s.entropy);
+    const numNodes = num(s.capacity && s.capacity.num_nodes);
+    if (entropy !== null && numNodes !== null && numNodes > 1) {
+      entropyRatio = entropy / Math.log(numNodes);
+    }
+  }
+  const lifecycle = s.lifecycle && typeof s.lifecycle === "object" ? s.lifecycle : {};
+  const stateUpdate =
+    lifecycle.state_update && typeof lifecycle.state_update === "object"
+      ? lifecycle.state_update : {};
+  return {
+    entropyRatio,
+    surprise: num(s.last_surprise) ?? num(s.surprise),
+    coherence: num(s.purpose_coherence) ?? num(stateUpdate.purpose_coherence),
+    turnCount: num(s.turn_count) ?? num(s.turn),
+  };
+}
+
+/**
  * 把 /soul 响应整理为【回魂】段（≤maxChars，默认 200）。
  * 阶段 1 六层：① 状态块 + ② 景观叙事 + ③ thought + 自述/最近（保留）。
  * 阶段 2 P1-1：② 景观叙事真实读 /landscape（landscapeData 透传，读数派生）；
@@ -1343,12 +1395,15 @@ export function buildSoulText(data, maxChars = SOUL_MAX_CHARS, reactData = null,
   }
 
   // 2. 状态（熵 / 惊讶 / 目的一致性 / 轮次）
+  //    2026-09-22 收尾：读数解析走 readSoulState（v1 名优先 + v2 形状兜底）。
+  //    此前只认 v1 名、而生产 /soul 返回 v2 形状 ⇒ 状态段恒缺（见 readSoulState 注释）。
   const st = data.lms_state && typeof data.lms_state === "object" ? data.lms_state : {};
+  const sv = readSoulState(st);
   const stBits = [];
-  if (typeof st.entropy_ratio === "number") stBits.push(`熵${st.entropy_ratio.toFixed(2)}`);
-  if (typeof st.last_surprise === "number") stBits.push(`惊讶${st.last_surprise.toFixed(2)}`);
-  if (typeof st.purpose_coherence === "number") stBits.push(`目的${st.purpose_coherence.toFixed(2)}`);
-  if (typeof st.turn_count === "number") stBits.push(`轮次${st.turn_count}`);
+  if (sv.entropyRatio !== null) stBits.push(`熵${sv.entropyRatio.toFixed(2)}`);
+  if (sv.surprise !== null) stBits.push(`惊讶${sv.surprise.toFixed(2)}`);
+  if (sv.coherence !== null) stBits.push(`目的${sv.coherence.toFixed(2)}`);
+  if (sv.turnCount !== null) stBits.push(`轮次${sv.turnCount}`);
   if (stBits.length > 0) parts.push(`状态:${stBits.join(" ")}`);
 
   // ② 景观叙事（阶段 2 P1-1：真实读 /landscape 读数派生，≤200 字；
@@ -1596,15 +1651,32 @@ const MACHINE_NARRATION_MARKERS = [
   "【重理解】",
 ];
 
+// 机器**写库/工具回执**（2026-09-22 收尾单 B）：think 链调度器把后台思考的 tool
+// 输出回写沙漏时的整句回执，例：`已写入 /tmp/think_output.json（session_id 原样回写
+// think-20260922072004-a1）。…`——现场它被当人类文本注入 `最近:` 段。
+// 判据（**形状锚定**，宁缺毋滥）：① 回执动词（已写入/已写/已产出/已完成）+ 机器
+// 产物路径 /tmp/think_{output,input}.json；② 机器产物路径 + `原样回写`；
+// ③ `session_id` + `原样回写`（少数无路径的旧回执）。
+// **故意不做裸 `已写入` / 裸 `原样回写` 包含**——人会写“我已经写入了”、
+// “原样回写的机制是什么”，那样会误剔真原话。
+// 单一来源：与 lms-core/message_markers.py 的 `MACHINE_RECEIPT_RES` 同批字面量
+// （跨语言不 import；新增先改 py 再镜像此处，防字面漂移）。
+const MACHINE_RECEIPT_RES = [
+  /(?:已写入|已写|已产出|已完成)[^｜\n]{0,48}\/tmp\/think_(?:output|input)\.json/,
+  /think_(?:output|input)\.json[^｜\n]{0,40}原样回写/,
+  /(?:session_id|session id)[^｜\n]{0,40}原样回写/,
+];
+
 /** 机器自述判定（纯函数）：条目/自述文本是否机器产物（非人类原话）。
- * 命中任一标记即判机器——用于焦点记忆条目、self_ref 自述、行动层文本。
+ * 命中任一标记/回执正则即判机器——用于焦点记忆条目、self_ref 自述、行动层文本。
  * fail-open：非字符串/空 → true（空内容无注入价值，等同剔除）。
  */
 export function isMachineNarration(text) {
   if (typeof text !== "string") return true;
   const t = text.trim();
   if (!t) return true;
-  return MACHINE_NARRATION_MARKERS.some((m) => t.includes(m));
+  if (MACHINE_NARRATION_MARKERS.some((m) => t.includes(m))) return true;
+  return MACHINE_RECEIPT_RES.some((re) => re.test(t));
 }
 
 /** 段级机器标记清洗（纯函数）：移除行内的 [信息性标注：…] 段（熵饱和区诊断

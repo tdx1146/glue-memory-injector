@@ -63,6 +63,7 @@ const {
   extractQueryInfo,
   stripMachineNoiseFromSoul,
   buildSoulOnlyWakeText,
+  readSoulState,
 } = await import("./memory-recall.js");
 
 let passed = 0;
