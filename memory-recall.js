@@ -1650,6 +1650,12 @@ export const MACHINE_NARRATION_MARKERS = [
   // 虽带 [dandan] 来源标签也**不冒充用户原话**）——现场它仍占注入位（`最近:【重理解】…`）。
   // 单一来源：与 message_markers.py 的 PRODUCER_PAYLOADS 同族（重理解产出）。
   "【重理解】",
+  // 2026-09-23 修复单 ③：小脑/sleep_prune.py 的巡检**回执标签**（机器制品）——
+  // 现场它占满回魂 `最近:` 段（前 5 条里 4/5）。
+  // 单一来源：lms-core/message_markers.py::MAINTENANCE_TAGS（py 侧定义、此处镜像；
+  // 字面量必须逐字相同）。★ 插件侧一致性：本仓库副本与已部署副本
+  // （~/.openclaw/plugins/glue-memory-injector/memory-recall.js）的 md5 必须相等。
+  "【睡眠减负】",
 ];
 
 // 机器**写库/工具回执**（2026-09-22 收尾单 B）：think 链调度器把后台思考的 tool
