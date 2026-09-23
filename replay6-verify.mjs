@@ -3,7 +3,7 @@
 // 前（改前）= 会话留存里的**真实注入**（replay6-collect.py 从 runtime-context 采集），
 //   ① 回魂在不在 ② 机器段计数 ③ 总字符数。
 // 后（改后）= **真函数 + 真只读端点**：buildMemoryContext(<历史醒因原文>) 经本地**只读代理**
-//   转发 /soul → glue:19000、/landscape → lms:8191；**/recall 一律拒发（500）** ——
+//   转发 /soul → glue:19000、/landscape → lms:18191；**/recall 一律拒发（500）** ——
 //   既证「唤醒轮不再召回（零 z 窗口扰动）」，又保证回放本身不碰生产写侧。
 // 人话零误伤：非唤醒人类轮 query 与旧函数**逐字节一致** + 人类轮注入形态不变。
 import { readFileSync } from "node:fs";
@@ -11,7 +11,7 @@ import http from "node:http";import { buildMemoryContext, _resetRateLimitForTest
   from "/vol1/@apphome/trim.openclaw/data/home/.openclaw/plugins/glue-memory-injector/memory-recall.js";
 
 const GLUE = "http://127.0.0.1:19000";
-const LMS = "http://127.0.0.1:8191";
+const LMS = "http://127.0.0.1:18191";
 const hygiene = resolveInjectHygiene({}, {});
 const WAKE_BANNERS = ["🌙【梦中醒来】", "📬【信箱新消息】", "【信箱·新留言】"];
 const MACHINE_RES = [
